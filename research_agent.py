@@ -30,7 +30,7 @@ import torch
 
 load_dotenv()
 
-Entrez.email = "rafailadam46@gmail.com"
+Entrez.email = "your-email"
 pi_llm = ChatOllama(model="qwen3:8b")
 worker_llm = ChatOllama(model='qwen3:1.7b')
 embeddings = HuggingFaceEmbeddings(model_name="FremyCompany/BioLORD-2023")
