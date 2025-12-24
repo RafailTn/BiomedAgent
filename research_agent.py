@@ -9,7 +9,6 @@ import os
 from Bio import Entrez
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
-from langchain_tavily import TavilySearch
 import re
 import requests
 import xml.etree.ElementTree as ET
@@ -27,23 +26,554 @@ from langchain_classic.retrievers import ContextualCompressionRetriever
 from langchain_core.prompts import PromptTemplate
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 import torch
+# New imports for enhancements
+import asyncio
+import aiohttp
+from collections import defaultdict
+from rank_bm25 import BM25Okapi
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-Entrez.email = "your-email"
-pi_llm = ChatOllama(model="qwen3:8b")
-worker_llm = ChatOllama(model='qwen3:1.7b')
-embeddings = HuggingFaceEmbeddings(model_name="FremyCompany/BioLORD-2023")
+Entrez.email = "rafailadam46@gmail.com"
+pi_llm = ChatOllama(model="ministral-3:8b")
+# worker_llm = ChatOllama(model='cniongolo/biomistral')
+embeddings = HuggingFaceEmbeddings(
+    model_name="FremyCompany/BioLORD-2023", 
+    model_kwargs={'device': 'cuda'}, 
+    encode_kwargs={'device': 'cuda', 'batch_size': 32}
+)
+
+# ============================================
+# RECIPROCAL RANK FUSION
+# ============================================
+
+def reciprocal_rank_fusion(
+    results_lists: List[List[Document]], 
+    k: int = 60,
+    top_n: Optional[int] = None
+) -> List[Document]:
+    """
+    Combine multiple ranked lists using Reciprocal Rank Fusion.
+    
+    RRF score = sum(1 / (k + rank)) across all lists where document appears.
+    
+    Args:
+        results_lists: List of ranked document lists from different retrieval methods
+        k: RRF constant (default 60, as per original paper)
+        top_n: Number of results to return (None = all)
+    
+    Returns:
+        Fused and re-ranked list of documents
+    """
+    scores: Dict[str, float] = defaultdict(float)
+    doc_map: Dict[str, Document] = {}
+    
+    for results in results_lists:
+        for rank, doc in enumerate(results):
+            # Create unique ID from content hash + pmid
+            doc_id = f"{doc.metadata.get('pmid', 'unknown')}_{hash(doc.page_content[:100])}"
+            
+            if doc_id not in doc_map:
+                doc_map[doc_id] = doc
+            
+            # RRF formula: 1 / (k + rank + 1)
+            # rank + 1 because ranks are 0-indexed
+            scores[doc_id] += 1.0 / (k + rank + 1)
+    
+    # Sort by RRF score descending
+    sorted_doc_ids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+    
+    # Build result list with scores in metadata
+    fused_results = []
+    for doc_id in sorted_doc_ids:
+        doc = doc_map[doc_id]
+        # Add RRF score to metadata for debugging/transparency
+        doc.metadata['rrf_score'] = scores[doc_id]
+        fused_results.append(doc)
+    
+    if top_n:
+        return fused_results[:top_n]
+    return fused_results
+
+
+# ============================================
+# BM25 SPARSE RETRIEVER
+# ============================================
+
+class BM25SparseRetriever:
+    """
+    BM25-based sparse retriever that works alongside dense retrieval.
+    Rebuilds index from vectorstore on initialization and can be refreshed.
+    """
+    
+    def __init__(self, vectorstore: Chroma):
+        self.vectorstore = vectorstore
+        self.documents: List[Document] = []
+        self.bm25: Optional[BM25Okapi] = None
+        self.corpus: List[List[str]] = []
+        self._build_index()
+    
+    def _tokenize(self, text: str) -> List[str]:
+        """Simple tokenization - lowercase and split on non-alphanumeric."""
+        return re.findall(r'\w+', text.lower())
+    
+    def _build_index(self):
+        """Build BM25 index from all documents in vectorstore."""
+        try:
+            collection = self.vectorstore._collection
+            count = collection.count()
+            
+            if count == 0:
+                logger.info("BM25: Vectorstore empty, skipping index build")
+                return
+            
+            # Get all documents from collection
+            all_docs = collection.get(include=['documents', 'metadatas'])
+            
+            self.documents = []
+            self.corpus = []
+            
+            for i, (content, metadata) in enumerate(zip(
+                all_docs.get('documents', []), 
+                all_docs.get('metadatas', [])
+            )):
+                if content:
+                    doc = Document(page_content=content, metadata=metadata or {})
+                    self.documents.append(doc)
+                    self.corpus.append(self._tokenize(content))
+            
+            if self.corpus:
+                self.bm25 = BM25Okapi(self.corpus)
+                logger.info(f"BM25: Built index with {len(self.corpus)} documents")
+            
+        except Exception as e:
+            logger.error(f"BM25: Failed to build index: {e}")
+            self.bm25 = None
+    
+    def refresh(self):
+        """Rebuild the BM25 index (call after adding new documents)."""
+        self._build_index()
+    
+    def search(self, query: str, k: int = 10) -> List[Document]:
+        """
+        Search using BM25.
+        
+        Args:
+            query: Search query
+            k: Number of results to return
+        
+        Returns:
+            List of Documents ranked by BM25 score
+        """
+        if not self.bm25 or not self.documents:
+            logger.warning("BM25: Index not available, returning empty results")
+            return []
+        
+        tokenized_query = self._tokenize(query)
+        scores = self.bm25.get_scores(tokenized_query)
+        
+        # Get top-k indices
+        top_indices = np.argsort(scores)[::-1][:k]
+        
+        results = []
+        for idx in top_indices:
+            if scores[idx] > 0:  # Only include if there's some relevance
+                doc = self.documents[idx]
+                doc.metadata['bm25_score'] = float(scores[idx])
+                results.append(doc)
+        
+        return results
+
+
+# ============================================
+# HYBRID RETRIEVER
+# ============================================
+
+class HybridRetriever:
+    """
+    Combines dense (embedding) and sparse (BM25) retrieval using RRF.
+    """
+    
+    def __init__(
+        self, 
+        vectorstore: Chroma, 
+        bm25_retriever: BM25SparseRetriever,
+        dense_weight: float = 0.6,
+        sparse_weight: float = 0.4,
+        dense_k: int = 20,
+        sparse_k: int = 20
+    ):
+        self.vectorstore = vectorstore
+        self.bm25_retriever = bm25_retriever
+        self.dense_weight = dense_weight
+        self.sparse_weight = sparse_weight
+        self.dense_k = dense_k
+        self.sparse_k = sparse_k
+    
+    def search(self, query: str, k: int = 10) -> List[Document]:
+        """
+        Perform hybrid search combining dense and sparse retrieval.
+        
+        Args:
+            query: Search query
+            k: Number of final results to return
+        
+        Returns:
+            List of Documents ranked by fused score
+        """
+        results_lists = []
+        
+        # Dense retrieval
+        try:
+            dense_results = self.vectorstore.similarity_search(query, k=self.dense_k)
+            if dense_results:
+                results_lists.append(dense_results)
+                logger.info(f"Hybrid: Dense retrieval returned {len(dense_results)} results")
+        except Exception as e:
+            logger.error(f"Hybrid: Dense retrieval failed: {e}")
+        
+        # Sparse retrieval
+        try:
+            sparse_results = self.bm25_retriever.search(query, k=self.sparse_k)
+            if sparse_results:
+                results_lists.append(sparse_results)
+                logger.info(f"Hybrid: Sparse retrieval returned {len(sparse_results)} results")
+        except Exception as e:
+            logger.error(f"Hybrid: Sparse retrieval failed: {e}")
+        
+        if not results_lists:
+            return []
+        
+        # Fuse results using RRF
+        fused = reciprocal_rank_fusion(results_lists, top_n=k)
+        logger.info(f"Hybrid: RRF fusion returned {len(fused)} results")
+        
+        return fused
+
+
+# ============================================
+# ASYNC PUBMED FETCHING
+# ============================================
+
+class AsyncPubMedFetcher:
+    """
+    Async PubMed fetcher for faster parallel retrieval.
+    Respects NCBI rate limits (3 requests/second without API key, 10 with).
+    """
+    
+    BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+    
+    def __init__(self, email: str, api_key: Optional[str] = None, max_concurrent: int = 3):
+        self.email = email
+        self.api_key = api_key
+        self.max_concurrent = max_concurrent
+        self.semaphore: Optional[asyncio.Semaphore] = None
+    
+    def _get_params(self, **kwargs) -> Dict[str, str]:
+        """Build request params with email and optional API key."""
+        params = {"email": self.email, **kwargs}
+        if self.api_key:
+            params["api_key"] = self.api_key
+        return params
+    
+    async def _rate_limited_request(
+        self, 
+        session: aiohttp.ClientSession, 
+        url: str, 
+        params: Dict[str, str]
+    ) -> Optional[str]:
+        """Make a rate-limited request."""
+        async with self.semaphore:
+            try:
+                async with session.get(url, params=params) as response:
+                    if response.status == 200:
+                        return await response.text()
+                    else:
+                        logger.warning(f"PubMed API returned status {response.status}")
+                        return None
+            except Exception as e:
+                logger.error(f"Request failed: {e}")
+                return None
+            finally:
+                # Rate limiting: wait between requests
+                await asyncio.sleep(0.35)  # ~3 requests per second
+    
+    async def search(self, term: str, retmax: int = 10) -> List[str]:
+        """
+        Search PubMed and return list of PMIDs.
+        
+        Args:
+            term: Search term
+            retmax: Maximum results to return
+        
+        Returns:
+            List of PMIDs
+        """
+        self.semaphore = asyncio.Semaphore(self.max_concurrent)
+        url = f"{self.BASE_URL}/esearch.fcgi"
+        params = self._get_params(db="pubmed", term=term, retmax=str(retmax), retmode="json")
+        
+        async with aiohttp.ClientSession() as session:
+            response = await self._rate_limited_request(session, url, params)
+            if response:
+                try:
+                    data = json.loads(response)
+                    return data.get("esearchresult", {}).get("idlist", [])
+                except json.JSONDecodeError:
+                    logger.error("Failed to parse search response")
+        return []
+    
+    async def fetch_abstracts(self, pmids: List[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Fetch abstracts for multiple PMIDs in parallel.
+        
+        Args:
+            pmids: List of PMIDs to fetch
+        
+        Returns:
+            Dict mapping PMID to article data
+        """
+        if not pmids:
+            return {}
+        
+        self.semaphore = asyncio.Semaphore(self.max_concurrent)
+        url = f"{self.BASE_URL}/efetch.fcgi"
+        
+        # Fetch in batches to avoid URL length limits
+        batch_size = 50
+        all_results = {}
+        
+        async with aiohttp.ClientSession() as session:
+            for i in range(0, len(pmids), batch_size):
+                batch = pmids[i:i + batch_size]
+                params = self._get_params(
+                    db="pubmed", 
+                    id=",".join(batch), 
+                    rettype="abstract", 
+                    retmode="xml"
+                )
+                
+                response = await self._rate_limited_request(session, url, params)
+                if response:
+                    parsed = self._parse_pubmed_xml(response)
+                    all_results.update(parsed)
+        
+        return all_results
+    
+    async def fetch_full_texts(self, pmids: List[str]) -> Dict[str, Optional[str]]:
+        """
+        Attempt to fetch full texts from PMC for given PMIDs.
+        
+        Args:
+            pmids: List of PMIDs
+        
+        Returns:
+            Dict mapping PMID to full text (or None if not available)
+        """
+        self.semaphore = asyncio.Semaphore(self.max_concurrent)
+        
+        # First, get PMC IDs for each PMID
+        pmc_mapping = await self._get_pmc_ids(pmids)
+        
+        if not pmc_mapping:
+            return {pmid: None for pmid in pmids}
+        
+        # Fetch full texts in parallel
+        async with aiohttp.ClientSession() as session:
+            tasks = []
+            pmid_order = []
+            
+            for pmid, pmc_id in pmc_mapping.items():
+                if pmc_id:
+                    tasks.append(self._fetch_single_full_text(session, pmc_id))
+                    pmid_order.append(pmid)
+            
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                full_texts = {}
+                for pmid, result in zip(pmid_order, results):
+                    if isinstance(result, Exception):
+                        full_texts[pmid] = None
+                    else:
+                        full_texts[pmid] = result
+                
+                # Add None for PMIDs without PMC IDs
+                for pmid in pmids:
+                    if pmid not in full_texts:
+                        full_texts[pmid] = None
+                
+                return full_texts
+        
+        return {pmid: None for pmid in pmids}
+    
+    async def _get_pmc_ids(self, pmids: List[str]) -> Dict[str, Optional[str]]:
+        """Get PMC IDs for PMIDs via elink."""
+        self.semaphore = asyncio.Semaphore(self.max_concurrent)
+        url = f"{self.BASE_URL}/elink.fcgi"
+        
+        mapping = {}
+        
+        async with aiohttp.ClientSession() as session:
+            # Process in smaller batches for elink
+            batch_size = 20
+            for i in range(0, len(pmids), batch_size):
+                batch = pmids[i:i + batch_size]
+                params = self._get_params(
+                    dbfrom="pubmed",
+                    db="pmc",
+                    id=",".join(batch),
+                    linkname="pubmed_pmc",
+                    retmode="json"
+                )
+                
+                response = await self._rate_limited_request(session, url, params)
+                if response:
+                    try:
+                        data = json.loads(response)
+                        linksets = data.get("linksets", [])
+                        for linkset in linksets:
+                            pmid = linkset.get("ids", [None])[0]
+                            if pmid:
+                                pmid = str(pmid)
+                                linksetdbs = linkset.get("linksetdbs", [])
+                                if linksetdbs:
+                                    links = linksetdbs[0].get("links", [])
+                                    if links:
+                                        mapping[pmid] = str(links[0])
+                                    else:
+                                        mapping[pmid] = None
+                                else:
+                                    mapping[pmid] = None
+                    except (json.JSONDecodeError, KeyError, IndexError) as e:
+                        logger.error(f"Failed to parse elink response: {e}")
+        
+        return mapping
+    
+    async def _fetch_single_full_text(
+        self, 
+        session: aiohttp.ClientSession, 
+        pmc_id: str
+    ) -> Optional[str]:
+        """Fetch full text for a single PMC ID."""
+        url = f"{self.BASE_URL}/efetch.fcgi"
+        params = self._get_params(db="pmc", id=pmc_id, rettype="full", retmode="xml")
+        
+        response = await self._rate_limited_request(session, url, params)
+        if response:
+            return self._extract_text_from_pmc_xml(response)
+        return None
+    
+    def _parse_pubmed_xml(self, xml_text: str) -> Dict[str, Dict[str, Any]]:
+        """Parse PubMed XML response into structured data."""
+        results = {}
+        try:
+            root = ET.fromstring(xml_text)
+            for article in root.findall('.//PubmedArticle'):
+                try:
+                    pmid_elem = article.find('.//PMID')
+                    if pmid_elem is None:
+                        continue
+                    pmid = pmid_elem.text
+                    
+                    title_elem = article.find('.//ArticleTitle')
+                    title = title_elem.text if title_elem is not None else "Unknown"
+                    
+                    # Extract abstract
+                    abstract_parts = []
+                    for abstract_text in article.findall('.//AbstractText'):
+                        if abstract_text.text:
+                            abstract_parts.append(abstract_text.text)
+                    abstract = " ".join(abstract_parts) if abstract_parts else "No abstract available."
+                    
+                    # Extract authors
+                    authors = []
+                    for author in article.findall('.//Author'):
+                        lastname = author.find('LastName')
+                        forename = author.find('ForeName')
+                        if lastname is not None:
+                            name = lastname.text
+                            if forename is not None:
+                                name += f" {forename.text}"
+                            authors.append(name)
+                    
+                    # Extract year
+                    year = None
+                    pub_date = article.find('.//PubDate/Year')
+                    if pub_date is not None:
+                        year = pub_date.text
+                    else:
+                        medline_date = article.find('.//PubDate/MedlineDate')
+                        if medline_date is not None and medline_date.text:
+                            year_match = re.search(r'\d{4}', medline_date.text)
+                            if year_match:
+                                year = year_match.group()
+                    
+                    results[pmid] = {
+                        "pmid": pmid,
+                        "title": title,
+                        "abstract": abstract,
+                        "authors": "; ".join(authors) if authors else "No authors listed",
+                        "year": year
+                    }
+                    
+                except Exception as e:
+                    logger.error(f"Failed to parse article: {e}")
+                    continue
+                    
+        except ET.ParseError as e:
+            logger.error(f"XML parse error: {e}")
+        
+        return results
+    
+    def _extract_text_from_pmc_xml(self, xml_text: str) -> Optional[str]:
+        """Extract body text from PMC XML."""
+        try:
+            root = ET.fromstring(xml_text)
+            text_parts = []
+            
+            # Try to find body paragraphs
+            for p in root.findall('.//body//p'):
+                if p.text:
+                    text_parts.append(p.text)
+                # Also get tail text and nested text
+                for child in p.iter():
+                    if child.text:
+                        text_parts.append(child.text)
+                    if child.tail:
+                        text_parts.append(child.tail)
+            
+            if not text_parts:
+                # Fallback: get all text from body
+                body = root.find('.//body')
+                if body is not None:
+                    text_parts = [t.strip() for t in body.itertext() if t.strip()]
+            
+            if text_parts:
+                full_text = ' '.join(text_parts)
+                full_text = re.sub(r'\s+', ' ', full_text).strip()
+                return full_text
+                
+        except ET.ParseError as e:
+            logger.error(f"PMC XML parse error: {e}")
+        
+        return None
+
 
 # ============================================
 # ENHANCED RAG COMPONENTS
 # ============================================
-# Query rewriter for better retrieval
+
 class QueryRewriter:
     """Rewrites queries to improve retrieval accuracy"""
     
     def __init__(self, llm=None):
-        self.llm = llm or worker_llm
+        self.llm = llm or pi_llm
         self.rewrite_prompt = PromptTemplate(
             input_variables=["query"],
             template="""Given the following query, generate 3 alternative search queries that would help find relevant biomedical literature. 
@@ -74,11 +604,12 @@ class QueryRewriter:
             
             return queries[:4]  # Return max 4 queries
         except Exception as e:
-            print(f"Query rewrite failed: {e}")
+            logger.warning(f"Query rewrite failed: {e}")
             return [query]  # Fallback to original
 
+
 # ============================================
-# RAG SETUP - FIXED PERSISTENCE AND RETRIEVER
+# RAG SETUP
 # ============================================
 
 os.makedirs("./pubmed_rag_db", exist_ok=True)
@@ -90,28 +621,38 @@ vectorstore = Chroma(
     collection_metadata={"hnsw:space": "cosine"}
 )
 
-# CREATE BASE RETRIEVER 
-base_retriever = vectorstore.as_retriever(
-    search_type="similarity",
-    search_kwargs={"k": 20}  # Retrieve more docs initially for reranking
-)
-
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=1000,
     chunk_overlap=200,
     separators=["\n\n", "\n", ". ", " ", ""]
 )
 
-# Initialize enhanced components with proper order
-query_rewriter = QueryRewriter(worker_llm)
-enc_model = HuggingFaceCrossEncoder(model_name='cross-encoder/ms-marco-MiniLM-L-6-v2')
-compressor = CrossEncoderReranker(model=enc_model, top_n=5)
-
-# Now create compression retriever with the base_retriever
-compression_retriever = ContextualCompressionRetriever(
-    base_compressor=compressor, 
-    base_retriever=base_retriever  # Now this is defined!
+# Initialize components
+query_rewriter = QueryRewriter(pi_llm)
+enc_model = HuggingFaceCrossEncoder(
+    model_name='ncbi/MedCPT-Cross-Encoder', 
+    model_kwargs={'device': 'cuda'}
 )
+compressor = CrossEncoderReranker(model=enc_model, top_n=10)
+
+# Initialize BM25 and Hybrid retriever
+bm25_retriever = BM25SparseRetriever(vectorstore)
+hybrid_retriever = HybridRetriever(
+    vectorstore=vectorstore,
+    bm25_retriever=bm25_retriever,
+    dense_weight=0.6,
+    sparse_weight=0.4,
+    dense_k=20,
+    sparse_k=20
+)
+
+# Async PubMed fetcher
+async_fetcher = AsyncPubMedFetcher(
+    email=Entrez.email,
+    api_key=os.getenv("NCBI_API_KEY"),  # Optional: set in .env for higher rate limits
+    max_concurrent=3
+)
+
 
 # ============================================
 # HELPER FUNCTIONS
@@ -141,33 +682,32 @@ def extract_authors(article):
     return '; '.join(authors) if authors else "No authors listed"
 
 
-def pubmed_search_and_store_multi_year(keywords: str, years: str = None, pnum: int = 10) -> str:
+async def async_pubmed_search_and_store(
+    keywords: str, 
+    years: str = None, 
+    pnum: int = 10
+) -> str:
     """
-    Enhanced version that handles multiple years.
+    Async version of PubMed search and store with parallel fetching.
     
     Args:
         keywords: Search keywords
-        years: Can be a single year ("2024"), multiple years ("2022,2023,2024"), 
-               or a range ("2022-2024")
+        years: Single year, comma-separated, or range (e.g., "2022-2024")
         pnum: Number of papers per year
     
     Returns:
-        Summary of all papers found and stored
+        Summary of papers found and stored
     """
-    # Parse years input
+    # Parse years
     year_list = []
-    
     if not years:
         year_list = [str(date.today().year)]
     elif "-" in years:
-        # Handle range like "2022-2024"
         start_year, end_year = years.split("-")
         year_list = [str(y) for y in range(int(start_year.strip()), int(end_year.strip()) + 1)]
     elif "," in years:
-        # Handle comma-separated like "2022,2023,2024"
         year_list = [y.strip() for y in years.split(",")]
     else:
-        # Single year
         year_list = [years.strip()]
     
     all_results = []
@@ -176,77 +716,42 @@ def pubmed_search_and_store_multi_year(keywords: str, years: str = None, pnum: i
     all_papers = []
     
     for year in year_list:
-        print(f"\nSearching PubMed for '{keywords}' in year {year}...")
-        # Build search term
+        logger.info(f"Searching PubMed for '{keywords}' in year {year}...")
         search_term = f"({keywords}) AND {year}[pdat]"
         
-        # Search PubMed
-        try:
-            handle = Entrez.esearch(db="pubmed", term=search_term, retmax=pnum, sort="relevance")
-            record = Entrez.read(handle)
-            handle.close()
-        except Exception as e:
-            all_results.append(f"Year {year}: Search failed - {e}")
-            continue
+        # Async search
+        pmids = await async_fetcher.search(search_term, retmax=pnum)
         
-        id_list = record["IdList"]
-        if not id_list:
+        if not pmids:
             all_results.append(f"Year {year}: No papers found")
             continue
         
-        # Fetch and process papers
-        try:
-            handle = Entrez.efetch(db="pubmed", id=id_list, rettype="abstract", retmode="xml")
-            articles = Entrez.read(handle)["PubmedArticle"]
-            handle.close()
-        except Exception as e:
-            all_results.append(f"Year {year}: Fetch failed - {e}")
+        logger.info(f"Found {len(pmids)} PMIDs, fetching abstracts...")
+        
+        # Async fetch abstracts
+        articles = await async_fetcher.fetch_abstracts(pmids)
+        
+        if not articles:
+            all_results.append(f"Year {year}: Failed to fetch papers")
             continue
+        
+        # Async fetch full texts
+        logger.info("Attempting to fetch full texts...")
+        full_texts = await async_fetcher.fetch_full_texts(pmids)
         
         year_papers = []
         year_full_text = 0
         
-        for article in articles:
+        for pmid, article in articles.items():
             try:
-                pmid = str(article['MedlineCitation']['PMID'])
-                title = article['MedlineCitation']['Article']['ArticleTitle']
-                authors = extract_authors(article)
+                title = article['title']
+                authors = article['authors']
+                abstract = article['abstract']
+                full_text = full_texts.get(pmid)
                 
-                # Extract abstract
-                abstract = "No abstract available."
-                if 'Abstract' in article['MedlineCitation']['Article']:
-                    abstract_list = article['MedlineCitation']['Article']['Abstract']['AbstractText']
-                    abstract = " ".join(str(a) for a in abstract_list)
-                
-                # Try to fetch full text
-                full_text = None
-                try:
-                    handle = Entrez.elink(dbfrom="pubmed", db="pmc", id=pmid, linkname="pubmed_pmc")
-                    record = Entrez.read(handle)
-                    handle.close()
-                    
-                    if record and record[0].get("LinkSetDb"):
-                        pmc_id_list = [link['Id'] for link in record[0]['LinkSetDb'][0]['Link']]
-                        if pmc_id_list:
-                            pmc_id = pmc_id_list[0]
-                            handle = Entrez.efetch(db="pmc", id=pmc_id, rettype="full", retmode="xml")
-                            xml_data = handle.read()
-                            handle.close()
-                            
-                            if xml_data:
-                                root = ET.fromstring(xml_data)
-                                text_parts = [p.text for p in root.findall('.//body//p') if p.text]
-                                if not text_parts:
-                                    body = root.find('.//body')
-                                    if body is not None:
-                                        text_parts = [text for text in body.itertext() if text.strip()]
-                                if text_parts:
-                                    full_text = ' '.join(text_parts)
-                                    full_text = re.sub(r'\s+', ' ', full_text).strip()
-                                    year_full_text += 1
-                                    print(f"  Full text retrieved for PMID:{pmid}")
-                except Exception:
-                    pass
+                if full_text:
+                    year_full_text += 1
+                    logger.info(f"  Full text retrieved for PMID:{pmid}")
                 
                 # Create content for vector store
                 content = f"PMID: {pmid}\nTitle: {title}\n"
@@ -279,10 +784,9 @@ def pubmed_search_and_store_multi_year(keywords: str, years: str = None, pnum: i
                 all_papers.append(f"{title}-(PMID:{pmid})\n")
                 
             except Exception as e:
-                print(f"  Error processing article: {e}")
+                logger.error(f"Error processing article {pmid}: {e}")
                 continue
         
-        # Summary for this year
         if year_papers:
             all_results.append(
                 f"Year {year}: Found {len(year_papers)} papers, "
@@ -291,48 +795,68 @@ def pubmed_search_and_store_multi_year(keywords: str, years: str = None, pnum: i
             total_stored += len(year_papers)
             total_full_text += year_full_text
     
+    # Refresh BM25 index after adding new documents
+    bm25_retriever.refresh()
+    logger.info("BM25 index refreshed")
+    
     # Final summary
     summary = f"SEARCH COMPLETE:\n"
     summary += f"Total papers stored: {total_stored}\n"
     summary += f"Total with full text: {total_full_text}\n\n"
-    summary += f"Titles with PMIDS: {all_papers}\n\n"
+    summary += f"Titles with PMIDs: {all_papers}\n\n"
     
     return summary
 
 
-# Original function kept for backward compatibility
-def pubmed_search_and_store(keywords: str, year: str = None, pnum: int = 10) -> str:
-    """Original single-year search function."""
-    return pubmed_search_and_store_multi_year(keywords, year, pnum)
+def pubmed_search_and_store_multi_year(keywords: str, years: str = None, pnum: int = 10) -> str:
+    """
+    Wrapper for async search - runs the async function in event loop.
+    """
+    try:
+        # Check if we're already in an event loop
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If loop is running, create a new task
+            import nest_asyncio
+            nest_asyncio.apply()
+            return loop.run_until_complete(
+                async_pubmed_search_and_store(keywords, years, pnum)
+            )
+        else:
+            return asyncio.run(async_pubmed_search_and_store(keywords, years, pnum))
+    except RuntimeError:
+        # No event loop, create one
+        return asyncio.run(async_pubmed_search_and_store(keywords, years, pnum))
 
 
 # Create tools
 pubmed_search_and_store_tool = tool(
     pubmed_search_and_store_multi_year,
-    description="Search PubMed for papers and store them. Supports single year, multiple years (comma-separated), or year ranges (e.g., 2022-2024)"
+    description="Search PubMed for papers and store them. Supports single year, multiple years (comma-separated), or year ranges (e.g., 2022-2024). Uses async fetching for faster results."
 )
+
 
 def enhanced_search_rag_database(
     query: str, 
     num_results: int = 10,
     use_reranking: bool = True,
-    use_compression: bool = True,
+    use_hybrid: bool = True,
     use_query_rewrite: bool = True
 ) -> str:
     """
-    Enhanced search with reranking and compression capabilities.
+    Enhanced search with hybrid retrieval, RRF fusion, and reranking.
     
     Args:
         query: Search query or PMID
         num_results: Number of results to return
         use_reranking: Whether to use cross-encoder reranking
-        use_compression: Whether to compress results
+        use_hybrid: Whether to use hybrid (dense + sparse) retrieval
         use_query_rewrite: Whether to rewrite query for better retrieval
     
     Returns:
         Formatted search results
     """
-    print(f"Enhanced search for: '{query}'")
+    logger.info(f"Enhanced search for: '{query}'")
     
     # Clean up query
     clean_query = query.replace("PMID:", "").replace("pmid:", "").strip()
@@ -341,93 +865,91 @@ def enhanced_search_rag_database(
     is_pmid_query = all(part.strip().isdigit() for part in clean_query.split(','))
     
     if is_pmid_query:
-        # CRITICAL FIX: For PMID queries, disable all enhancements
-        print(f"   PMID query detected - disabling enhancements for precise retrieval")
+        # PMID query - disable all enhancements for precise retrieval
+        logger.info("PMID query detected - disabling enhancements")
         
         pmids = [p.strip() for p in clean_query.split(',')]
         results = []
         for pmid in pmids:
             try:
-                # Use a filter-based approach to get ONLY documents with this PMID
-                # First, get the collection directly for more precise filtering
                 collection = vectorstore._collection
-                
-                # Get ALL chunks for this specific PMID using metadata filter
-                pmid_docs = collection.get(
-                    where={"pmid": pmid}
-                )
+                pmid_docs = collection.get(where={"pmid": pmid})
                 
                 if pmid_docs and pmid_docs['ids']:
-                    # Convert back to Document objects
                     for i, doc_id in enumerate(pmid_docs['ids']):
                         doc = Document(
-                            page_content=pmid_docs['documents'][i] if 'documents' in pmid_docs else pmid_docs['documents'][i],
-                            metadata=pmid_docs['metadatas'][i] if 'metadatas' in pmid_docs else {}
+                            page_content=pmid_docs['documents'][i],
+                            metadata=pmid_docs['metadatas'][i] if pmid_docs['metadatas'] else {}
                         )
                         results.append(doc)
-                
-                # Sort by chunk index to maintain order
-                pmid_results = [r for r in results if r.metadata.get('pmid') == pmid]
-                pmid_results.sort(key=lambda x: x.metadata.get('chunk_index', 0))
-                
+                    
+                    # Sort by chunk index
+                    pmid_results = [r for r in results if r.metadata.get('pmid') == pmid]
+                    pmid_results.sort(key=lambda x: x.metadata.get('chunk_index', 0))
+                    
             except Exception as e:
-                print(f"Error fetching PMID {pmid}: {e}")
-                # Fallback to similarity search if direct collection access fails
-                pmid_results = vectorstore.similarity_search(
-                    f"PMID: {pmid}", 
-                    k=50  # Get many to ensure we get all chunks
-                )
+                logger.error(f"Error fetching PMID {pmid}: {e}")
+                # Fallback to similarity search
+                pmid_results = vectorstore.similarity_search(f"PMID: {pmid}", k=50)
                 pmid_results = [r for r in pmid_results if r.metadata.get('pmid') == pmid]
                 pmid_results.sort(key=lambda x: x.metadata.get('chunk_index', 0))
                 results.extend(pmid_results)
         
         if not results:
             return f"No paper found with PMID: {clean_query}"
-        
-        # For PMID queries, DO NOT apply any reranking or compression
-        # Just return all chunks for the requested paper(s)
             
     else:
-        # Enhanced keyword search - apply all enhancements
-        print(f"   Options: rerank={use_reranking}, compress={use_compression}, rewrite={use_query_rewrite}")
-        
-        all_results = []
+        # Keyword search - apply all enhancements
+        logger.info(f"Options: rerank={use_reranking}, hybrid={use_hybrid}, rewrite={use_query_rewrite}")
         
         # Query rewriting
         if use_query_rewrite:
             queries = query_rewriter.rewrite(query)
-            print(f"   Rewritten queries: {queries}")
+            logger.info(f"Rewritten queries: {queries}")
         else:
             queries = [query]
+        
+        all_results_lists = []
         
         # Search with all query variations
         for q in queries:
             try:
-                # Increase initial retrieval for better reranking
-                k_retrieve = num_results * 3 if use_reranking else num_results
-                search_results = vectorstore.similarity_search_with_score(q, k=k_retrieve)
-                all_results.extend(search_results)
+                if use_hybrid:
+                    # Use hybrid retriever (dense + sparse with RRF)
+                    search_results = hybrid_retriever.search(q, k=num_results * 2)
+                else:
+                    # Dense only
+                    search_results = vectorstore.similarity_search(q, k=num_results * 2)
+                
+                if search_results:
+                    all_results_lists.append(search_results)
+                    
             except Exception as e:
-                print(f"Search failed for query '{q}': {e}")
+                logger.error(f"Search failed for query '{q}': {e}")
+        
+        if not all_results_lists:
+            return "No relevant papers found in local database."
+        
+        # Fuse results from multiple queries using RRF
+        if len(all_results_lists) > 1:
+            results = reciprocal_rank_fusion(all_results_lists, top_n=num_results * 2)
+            logger.info(f"Fused {len(all_results_lists)} query results via RRF")
+        else:
+            results = all_results_lists[0]
         
         # Deduplicate by content
         seen_content = set()
         unique_results = []
-        for doc, score in all_results:
-            content_hash = hash(doc.page_content[:100])  # Use first 100 chars as hash
+        for doc in results:
+            content_hash = hash(doc.page_content[:100])
             if content_hash not in seen_content:
                 seen_content.add(content_hash)
                 unique_results.append(doc)
         
-        # Apply reranking and/or compression ONLY for keyword searches
+        # Apply cross-encoder reranking
         if use_reranking and len(unique_results) > 1:
-            print(f"   Reranking {len(unique_results)} results...")
-            if use_compression:
-                # Use the compression_retriever which combines both
-                results = compression_retriever.invoke(query)
-            else:
-                # Just rerank without compression
-                results = compressor.compress_documents(unique_results, query)
+            logger.info(f"Reranking {len(unique_results)} results with cross-encoder...")
+            results = compressor.compress_documents(unique_results, query)[:num_results]
         else:
             results = unique_results[:num_results]
     
@@ -445,58 +967,54 @@ def enhanced_search_rag_database(
                 "authors": doc.metadata.get("authors", "Unknown"),
                 "year": doc.metadata.get("year", "Unknown"),
                 "has_full_text": doc.metadata.get("has_full_text", False),
-                "relevance_score": doc.metadata.get("relevance_score", 0),
+                "rrf_score": doc.metadata.get("rrf_score", 0),
                 "chunks": []
             }
         papers_dict[pmid]["chunks"].append(doc.page_content)
     
-    # Sort by relevance score if available (but not for PMID queries)
+    # Sort by RRF score if available
     if not is_pmid_query:
         sorted_papers = sorted(
             papers_dict.items(), 
-            key=lambda x: x[1].get("relevance_score", 0), 
+            key=lambda x: x[1].get("rrf_score", 0), 
             reverse=True
         )
     else:
-        # For PMID queries, maintain the order requested
         sorted_papers = list(papers_dict.items())
     
     # Format output
     output = []
     output.append(f"Found {len(sorted_papers)} relevant paper(s)")
     
-    # Only show enhancement info for keyword searches
-    if not is_pmid_query and (use_reranking or use_compression):
+    if not is_pmid_query:
         enhancements = []
+        if use_hybrid:
+            enhancements.append("hybrid search")
         if use_reranking:
-            enhancements.append("reranking")
-        if use_compression:
-            enhancements.append("compression")
-        output.append(f"   (Enhanced with: {', '.join(enhancements)})")
-    elif is_pmid_query:
-        output.append(f"   (Direct PMID retrieval - no enhancements applied)")
+            enhancements.append("cross-encoder reranking")
+        if use_query_rewrite:
+            enhancements.append("query expansion")
+        if enhancements:
+            output.append(f"   (Enhanced with: {', '.join(enhancements)})")
+    else:
+        output.append("   (Direct PMID retrieval - no enhancements applied)")
     
     output.append("\n")
     
-    # For PMID queries, show ALL content; for keyword searches, limit based on num_results
     display_limit = len(sorted_papers) if is_pmid_query else min(num_results, len(sorted_papers))
     
     for idx, (pmid, info) in enumerate(sorted_papers[:display_limit], 1):
         content_type = "full text" if info['has_full_text'] else "abstract"
-        
-        # Combine chunks
         combined_content = "\n\n".join(info['chunks'])
         
-        # For PMID queries with single paper, show full content
-        # For multiple papers or keyword searches, limit display length
         if is_pmid_query and len(sorted_papers) == 1:
-            # Show full content for single PMID query
             display_content = combined_content
         elif len(sorted_papers) > 1:
-            # Limit for multiple papers
             max_length = 500
             if len(combined_content) > max_length:
                 display_content = combined_content[:max_length] + "..."
+            else:
+                display_content = combined_content
         else:
             display_content = combined_content
         
@@ -515,57 +1033,35 @@ def enhanced_search_rag_database(
     return "".join(output)
 
 
-# Updated wrapper function to be smarter about when to apply enhancements
 def search_rag_database(query: str, num_results: int = 10) -> str:
-    """
-    Original search function with smart enhancement detection.
-    Automatically disables enhancements for PMID queries.
-    """
-    # Check if this is a PMID query
+    """Search with smart enhancement detection."""
     clean_query = query.replace("PMID:", "").replace("pmid:", "").strip()
     is_pmid_query = all(part.strip().isdigit() for part in clean_query.split(','))
     
-    # Disable enhancements for PMID queries
     if is_pmid_query:
         return enhanced_search_rag_database(
-            query, 
-            num_results,
-            use_reranking=False,  # Disabled for PMID
-            use_compression=False,  # Disabled for PMID
-            use_query_rewrite=False  # Disabled for PMID
+            query, num_results,
+            use_reranking=False,
+            use_hybrid=False,
+            use_query_rewrite=False
         )
     else:
-        # Enable all enhancements for keyword searches
         return enhanced_search_rag_database(
-            query, 
-            num_results,
+            query, num_results,
             use_reranking=True,
-            use_compression=True,
+            use_hybrid=True,
             use_query_rewrite=True
         )
-
-# Wrapper for backward compatibility
-def search_rag_database(query: str, num_results: int = 10) -> str:
-    """Original search function with enhanced capabilities enabled by default"""
-    return enhanced_search_rag_database(
-        query, 
-        num_results,
-        use_reranking=True,
-        use_compression=True,
-        use_query_rewrite=True
-    )
 
 
 search_rag_database_tool = tool(
     search_rag_database,
-    description="Search RAG database with automatic reranking and compression for better results"
+    description="Search RAG database with hybrid retrieval (dense + sparse), RRF fusion, and cross-encoder reranking"
 )
 
-
-# Additional tool for fine-tuned search control
 enhanced_search_tool = tool(
     enhanced_search_rag_database,
-    description="Advanced search with control over reranking, compression, and query rewriting"
+    description="Advanced search with control over hybrid retrieval, reranking, and query rewriting"
 )
 
 
@@ -578,7 +1074,8 @@ def check_rag_for_topic(keywords: str) -> str:
         if count == 0:
             return "Database is empty. No papers stored yet."
         
-        results = vectorstore.similarity_search(keywords, k=5)
+        # Use hybrid search for better topic matching
+        results = hybrid_retriever.search(keywords, k=5)
         
         if not results:
             return f"No papers found for '{keywords}' in database ({count} total chunks)."
@@ -607,17 +1104,9 @@ check_rag_for_topic_tool = tool(check_rag_for_topic)
 def remove_from_rag_database(identifier: str, search_type: str = "auto") -> str:
     """
     Remove entries from the RAG database based on PMID or query.
-    
-    Args:
-        identifier: Either a PMID (or comma-separated PMIDs) or search keywords
-        search_type: "pmid", "query", or "auto" (auto-detect)
-    
-    Returns:
-        Summary of deletion operation
     """
-    print(f"Attempting to remove from database: '{identifier}' (type: {search_type})")
+    logger.info(f"Attempting to remove from database: '{identifier}' (type: {search_type})")
     
-    # Auto-detect if this is a PMID
     if search_type == "auto":
         clean_id = identifier.replace("PMID:", "").replace("pmid:", "").strip()
         if all(part.strip().isdigit() for part in clean_id.split(',')):
@@ -629,24 +1118,20 @@ def remove_from_rag_database(identifier: str, search_type: str = "auto") -> str:
         collection = vectorstore._collection
         
         if search_type == "pmid":
-            # Remove by PMID(s)
             pmids = [p.strip() for p in identifier.replace("PMID:", "").replace("pmid:", "").strip().split(',')]
             total_deleted = 0
             
             for pmid in pmids:
-                # Get all documents with this PMID
-                results = collection.get(
-                    where={"pmid": pmid}
-                )
+                results = collection.get(where={"pmid": pmid})
                 
                 if results and results['ids']:
-                    # Delete all chunks for this PMID
                     collection.delete(ids=results['ids'])
                     deleted_count = len(results['ids'])
                     total_deleted += deleted_count
-                    print(f"   Deleted {deleted_count} chunks for PMID: {pmid}")
-                else:
-                    print(f"   No documents found for PMID: {pmid}")
+                    logger.info(f"Deleted {deleted_count} chunks for PMID: {pmid}")
+            
+            # Refresh BM25 index after deletion
+            bm25_retriever.refresh()
             
             if total_deleted > 0:
                 return f"Successfully deleted {total_deleted} chunks from {len(pmids)} PMID(s)"
@@ -654,14 +1139,11 @@ def remove_from_rag_database(identifier: str, search_type: str = "auto") -> str:
                 return f"No documents found for PMIDs: {', '.join(pmids)}"
                 
         elif search_type == "query":
-            # Remove by similarity search
-            # First, find relevant documents
-            results = vectorstore.similarity_search(identifier, k=20)
+            results = hybrid_retriever.search(identifier, k=20)
             
             if not results:
                 return f"No documents found matching query: '{identifier}'"
             
-            # Group by PMID to show what will be deleted
             pmids_to_delete = {}
             for doc in results:
                 pmid = doc.metadata.get("pmid", "unknown")
@@ -669,20 +1151,19 @@ def remove_from_rag_database(identifier: str, search_type: str = "auto") -> str:
                 if pmid not in pmids_to_delete:
                     pmids_to_delete[pmid] = title
             
-            # Confirm deletion
             output = f"Found {len(pmids_to_delete)} paper(s) matching '{identifier}':\n"
             for pmid, title in pmids_to_delete.items():
                 output += f"  - PMID: {pmid} | {title[:60]}...\n"
             
-            # Delete all chunks for these PMIDs
             total_deleted = 0
             for pmid in pmids_to_delete.keys():
-                results = collection.get(
-                    where={"pmid": pmid}
-                )
+                results = collection.get(where={"pmid": pmid})
                 if results and results['ids']:
                     collection.delete(ids=results['ids'])
                     total_deleted += len(results['ids'])
+            
+            # Refresh BM25 index after deletion
+            bm25_retriever.refresh()
             
             output += f"\nDeleted {total_deleted} total chunks from {len(pmids_to_delete)} papers."
             return output
@@ -703,7 +1184,6 @@ def get_database_stats() -> str:
         if count == 0:
             return "Database is empty (0 chunks, 0 papers)"
         
-        # Sample to get statistics
         sample_results = vectorstore.similarity_search("", k=min(100, count))
         
         unique_pmids = set()
@@ -734,7 +1214,8 @@ def get_database_stats() -> str:
         if years:
             output += f"├─ Year range: {min(years)} - {max(years)}\n"
         
-        output += f"└─ Enhanced features: ✓ Reranking ✓ Compression ✓ Query Rewriting\n"
+        output += f"├─ BM25 index: {'✓ Active' if bm25_retriever.bm25 else '✗ Not built'}\n"
+        output += f"└─ Features: ✓ Hybrid Search ✓ RRF Fusion ✓ Reranking ✓ Query Rewriting\n"
         
         if unique_titles:
             output += f"\nSample papers:\n"
@@ -748,77 +1229,58 @@ def get_database_stats() -> str:
 
 get_database_stats_tool = tool(get_database_stats)
 
+
 # ============================================
-# ENHANCED AGENT SETUP
+# AGENT SETUP
 # ============================================
 
 memory = MemorySaver()
 
-# Enhanced system prompt
-system_prompt = '''You are an advanced PubMed research assistant with enhanced RAG capabilities including:
-- Query rewriting for better retrieval
-- Cross-encoder reranking for relevance
-- Semantic compression for focused content
+system_prompt = '''You are a PubMed research assistant. You help users find and analyze scientific papers.
 
-ENHANCED FEATURES:
-1. **Query Rewriting**: Automatically generates multiple query variations to improve retrieval
-2. **Reranking**: Uses cross-encoder models to reorder results by relevance
-3. **Compression**: Extracts only the most relevant portions of documents
+CRITICAL RULE - READ THIS FIRST:
+You can ONLY cite papers that appear in tool results. If a PMID is not in the tool output, you do not know about it.
+When uncertain, say "I don't have information about that" rather than guessing.
 
-IMPORTANT PAPER RETRIEVAL RULES:
-
-1. SPECIFIC PAPER REQUESTS:
-   - When user asks about a SPECIFIC paper (by PMID or title), retrieve ONLY that paper
-   - Use the exact PMID if provided (e.g., "tell me about PMID 12345" → search "12345")
-   - Use the paper title if that's what they reference
-   - The search will return COMPLETE content for single papers
-
-2. MULTIPLE PAPERS:
-   - When user asks about a topic, retrieve multiple relevant papers
-   - Enhanced search will automatically rerank and compress for better results
-   - Provide summaries and comparisons across papers
-
-3. SEARCH STRATEGIES:
-   - For "tell me more about [specific paper]": Use PMID or title for targeted retrieval
-   - For "what does [paper] say about X": First retrieve the specific paper by PMID
-   - For general topics: Use keyword search with automatic enhancement
-
-ENHANCED SEARCH CAPABILITIES:
-- The search tool now automatically applies:
-  * Query rewriting to find more relevant papers
-  * Reranking to prioritize most relevant results
-  * Compression to focus on query-relevant content
-- You can use 'enhanced_search_tool' for fine control over these features
-
-DELETION RULES:
-- When asked to remove/delete papers, use 'remove_from_rag_tool'
-- Can delete by PMID (preferred) or by search query
-- Always confirm what will be deleted before proceeding
-- Inform user of deletion results
+TOOLS YOU HAVE:
+1. pubmed_search_and_store_tool - Search PubMed and add papers to database (async, faster)
+2. search_rag_database_tool - Find papers with hybrid search (dense + sparse retrieval)
+3. check_rag_for_topic_tool - Check if a topic exists in database
+4. remove_from_rag_tool - Delete papers from database
+5. get_database_stats_tool - Show database statistics
 
 WORKFLOW:
-1. Check local database with 'check_rag_for_topic_tool'
-2. For existing papers:
-   - Use 'search_rag_database_tool' (automatically enhanced)
-   - Or use 'enhanced_search_tool' for manual control
-3. For new searches:
-   - Use 'pubmed_search_and_store_tool' first
-   - Then retrieve with enhanced search
-   - Ask the user for next steps
-
-CRITICAL RULES:
-- When discussing a specific paper, cite ONLY from that paper's content
-- Never mix information from different papers unless explicitly comparing
-- Always use PMIDs when referring to specific papers
-- When a user asks for "more details" about a paper, retrieve it by PMID
-- Note when results have been reranked or compressed for transparency
+1. User asks about a topic
+2. Use check_rag_for_topic_tool to see if you have papers
+3. If yes → use search_rag_database_tool to retrieve them
+4. If no → use pubmed_search_and_store_tool to fetch new papers
+5. Answer using ONLY the retrieved content
 
 RESPONSE FORMAT:
-- For single paper: Provide comprehensive analysis using all available content
-- For multiple papers: Provide structured comparisons with relevance scores
-- Always cite with format: "According to [Title] (PMID: [number])..."
-- Mention if results were enhanced (reranked/compressed) for transparency
-- Never make up information. Include only information retrieved from papers in answers'''
+When citing a paper, use EXACTLY this format:
+  [PMID:12345678] "Paper Title" - Author et al.
+
+Only use PMIDs that appear in your tool results. Never invent a PMID.
+
+<examples>
+USER: What do we know about CRISPR off-target effects?
+
+GOOD RESPONSE:
+Based on the papers in the database:
+
+[PMID:34521234] "Genome-wide detection of CRISPR off-targets" - Chen et al.
+This study found that off-target effects occur at sites with up to 4 mismatches...
+
+[PMID:34892156] "Reducing off-target activity with modified Cas9" - Park et al.
+The authors developed a high-fidelity Cas9 variant that reduced off-targets by 80%...
+
+BAD RESPONSE (DO NOT DO THIS):
+Studies have shown that CRISPR off-target effects are a major concern (Smith 2023, PMID:99999999).
+Research by Johnson et al. demonstrated that...
+[This is BAD because it invents citations not from tool results]
+</examples>
+
+REMEMBER: No PMID in tool output = You don't know about it. Never guess.'''
 
 tools = [
     pubmed_search_and_store_tool,
@@ -836,14 +1298,16 @@ pubmed_agent = create_agent(
     checkpointer=memory,
 )
 
+
 def main():
-    print("PubMed Research Assistant")
+    print("PubMed Research Assistant (Enhanced)")
+    print("Features: Hybrid Search | RRF Fusion | Async Fetching | Cross-Encoder Reranking")
     print("Commands: 'exit' to quit, 'stats' for database info, 'clear' to clear screen\n")
     
     stats_result = get_database_stats()
     print(f"{stats_result}\n")
     
-    config = {"configurable": {"thread_id": "cli-thread"}, "recursion_limit":250}
+    config = {"configurable": {"thread_id": "cli-thread"}, "recursion_limit": 250}
     
     while True:
         try:
@@ -861,12 +1325,18 @@ def main():
                 os.system('cls' if os.name == 'nt' else 'clear')
                 continue
             
+            if user_input.lower() == "refresh":
+                print("Refreshing BM25 index...")
+                bm25_retriever.refresh()
+                print("Done!\n")
+                continue
+            
             # Test command for direct multi-year search
             if user_input.lower().startswith("test multi"):
                 parts = user_input[10:].strip().split()
                 keywords = parts[0] if parts else "CRISPR"
                 years = parts[1] if len(parts) > 1 else "2022-2024"
-                print(f"\nTesting multi-year search: '{keywords}' for years {years}...")
+                print(f"\nTesting async multi-year search: '{keywords}' for years {years}...")
                 result = pubmed_search_and_store_multi_year(keywords, years, pnum=3)
                 print(result)
                 print(f"\n{get_database_stats()}\n")
@@ -875,13 +1345,11 @@ def main():
             # Regular agent interaction
             print("\nProcessing...")
             
-            # Invoke agent with increased recursion limit for complex multi-year searches
             result = pubmed_agent.invoke(
                 {"messages": [HumanMessage(content=user_input)]},
                 config={"configurable": {"thread_id": "cli-thread"}, "recursion_limit": 250}
             )
             
-            # Print response
             for msg in reversed(result['messages']):
                 if isinstance(msg, AIMessage) and msg.content:
                     print(f"\nAI: {msg.content}\n")
