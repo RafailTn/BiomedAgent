@@ -685,7 +685,7 @@ def extract_authors(article):
 async def async_pubmed_search_and_store(
     keywords: str, 
     years: str = None, 
-    pnum: int = 10
+    pnum: int = 5
 ) -> str:
     """
     Async version of PubMed search and store with parallel fetching.
@@ -1243,8 +1243,8 @@ You can ONLY cite papers that appear in tool results. If a PMID is not in the to
 When uncertain, say "I don't have information about that" rather than guessing.
 
 TOOLS YOU HAVE:
-1. pubmed_search_and_store_tool - Search PubMed and add papers to database (async, faster)
-2. search_rag_database_tool - Find papers with hybrid search (dense + sparse retrieval)
+1. pubmed_search_and_store_tool - Search PubMed and add papers to database
+2. search_rag_database_tool - Find papers in your database
 3. check_rag_for_topic_tool - Check if a topic exists in database
 4. remove_from_rag_tool - Delete papers from database
 5. get_database_stats_tool - Show database statistics
@@ -1257,28 +1257,18 @@ WORKFLOW:
 5. Answer using ONLY the retrieved content
 
 RESPONSE FORMAT:
-When citing a paper, use EXACTLY this format:
-  [PMID:12345678] "Paper Title" - Author et al.
+When citing a paper, use this format:
+  [PMID:NUMBER] "Exact Title From Tool Output" - First Author et al.
 
+Example format ONLY (do not use these fake PMIDs):
+  [PMID:00000001] "Example Paper Title" - Smith et al.
+  
 Only use PMIDs that appear in your tool results. Never invent a PMID.
 
-<examples>
-USER: What do we know about CRISPR off-target effects?
-
-GOOD RESPONSE:
-Based on the papers in the database:
-
-[PMID:34521234] "Genome-wide detection of CRISPR off-targets" - Chen et al.
-This study found that off-target effects occur at sites with up to 4 mismatches...
-
-[PMID:34892156] "Reducing off-target activity with modified Cas9" - Park et al.
-The authors developed a high-fidelity Cas9 variant that reduced off-targets by 80%...
-
-BAD RESPONSE (DO NOT DO THIS):
-Studies have shown that CRISPR off-target effects are a major concern (Smith 2023, PMID:99999999).
-Research by Johnson et al. demonstrated that...
-[This is BAD because it invents citations not from tool results]
-</examples>
+FORBIDDEN:
+- Do not cite any PMID not in tool output
+- Do not copy topics from this prompt into searches
+- Do not reference papers you have not retrieved
 
 REMEMBER: No PMID in tool output = You don't know about it. Never guess.'''
 
@@ -1347,7 +1337,7 @@ def main():
             
             result = pubmed_agent.invoke(
                 {"messages": [HumanMessage(content=user_input)]},
-                config={"configurable": {"thread_id": "cli-thread"}, "recursion_limit": 250}
+                config={"configurable": {"thread_id": "cli-thread"}, "recursion_limit": 500}
             )
             
             for msg in reversed(result['messages']):
