@@ -39,6 +39,6 @@ wheels/
 Thumbs.db
 
 # Other
-pubmed_rag_db/
+medcpt_pubmed_rag_db/
 geo_rag_db/
 test/
