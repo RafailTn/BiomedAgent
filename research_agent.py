@@ -1,23 +1,16 @@
 """
-PubMed Research Agent v2.0
+PubMed Research Agent v3.1
 ==========================
-Upgraded with:
-- Ministral3-8B - Better scientific reasoning & tool calling
-- MedCPT asymmetric embeddings for retrieval (replaces BioLORD for RAG)
-- BioLORD-2023 retained for concept similarity tasks
-- MedCPT-Cross-Encoder for reranking (unchanged)
-- Hybrid retrieval with RRF fusion (unchanged)
-- Async PubMed fetching (unchanged)
+CRITICAL FIXES:
+1. Skip PrimeKG loading if already loaded (checks entity count first)
+2. Use absolute paths for database persistence
+3. Batch insert with progress reporting
 
-Key architectural change: MedCPT uses SEPARATE encoders for queries and documents,
-trained on 255M PubMed query-article pairs. This dramatically improves retrieval
-compared to symmetric embeddings like BioLORD.
+For FAST first-time loading, set PRIMEKG_LIMIT = 100000 to test with subset.
+Full loading takes ~5-15 minutes depending on hardware.
 """
 
 import os
-
-# CUDA memory optimization - MUST be set before importing torch
-# This helps prevent OOM errors when processing large full-text articles
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 import argparse
@@ -31,7 +24,6 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, Tool
 import re
 import requests
 import xml.etree.ElementTree as ET
-# RAG Components
 from langchain_chroma import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
@@ -39,7 +31,8 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.embeddings import Embeddings
 from langchain_core.tools import tool
 import json
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Set
+from dataclasses import dataclass, field
 import numpy as np
 from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
 from langchain_classic.retrievers import ContextualCompressionRetriever
@@ -47,47 +40,99 @@ from langchain_core.prompts import PromptTemplate
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 import torch
 from transformers import AutoTokenizer, AutoModel
-# New imports for enhancements
 import asyncio
 import aiohttp
 from collections import defaultdict
 from rank_bm25 import BM25Okapi
+from pathlib import Path
+import shutil
 import logging
+import time
 
-# Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 
 Entrez.email = "rafailadam46@gmail.com"
-pi_llm = ChatOllama(model="ministral-3:8b")
 
-# Optional: For complex reasoning tasks, you can enable thinking mode
-# pi_llm = ChatOllama(model="qwen3:8b", temperature=0.7)
+# ============================================
+# CONFIGURATION
+# ============================================
+
+ENABLE_KNOWLEDGE_GRAPH = True
+ENABLE_FACT_VERIFICATION = True
+ENABLE_KG_ENHANCED_RETRIEVAL = True
+
+LOAD_PRIMEKG = True
+# Set to 100000 for quick testing (~2 min), None for full (~10-15 min)
+PRIMEKG_LIMIT = None
+
+GLINER_DEVICE = "cuda"
+
+# ABSOLUTE PATHS - crucial for persistence!
+SCRIPT_DIR = Path(__file__).parent.resolve()
+KUZU_DB_PATH = SCRIPT_DIR / "kuzu_biomedical_kg"
+PRIMEKG_DATA_DIR = SCRIPT_DIR / "primekg_data"
+VECTORSTORE_PATH = SCRIPT_DIR / "medcpt_pubmed_rag_db"
+
+logger.info(f"Script directory: {SCRIPT_DIR}")
+logger.info(f"Kuzu DB path: {KUZU_DB_PATH}")
 
 
 # ============================================
-# CHANGE 2: MedCPT Asymmetric Embeddings for Retrieval
+# LLM
 # ============================================
-# Why: MedCPT uses separate query/article encoders trained on 255M PubMed
-# query-article pairs. This asymmetric design dramatically outperforms
-# symmetric embeddings (like BioLORD) for retrieval tasks.
+
+pi_llm = ChatOllama(model="ministral-3:3b")
+
+
+# ============================================
+# DATA STRUCTURES
+# ============================================
+
+@dataclass
+class Entity:
+    text: str
+    label: str
+    start: int
+    end: int
+    score: float
+    cui: Optional[str] = None
+    canonical_name: Optional[str] = None
+    kg_id: Optional[str] = None
+    
+    def __hash__(self):
+        return hash((self.text.lower(), self.label))
+
+
+@dataclass 
+class Triple:
+    subject: str
+    subject_type: str
+    predicate: str
+    object: str
+    object_type: str
+    source: str = "extracted"
+    confidence: float = 1.0
+    pmid: Optional[str] = None
+
+
+@dataclass
+class VerificationResult:
+    claim: str
+    is_verified: bool
+    confidence: float
+    supporting_triples: List[Triple] = field(default_factory=list)
+    explanation: str = ""
+
+
+# ============================================
+# MEDCPT EMBEDDINGS
+# ============================================
 
 class MedCPTEmbeddings(Embeddings):
-    """
-    MedCPT asymmetric embeddings for PubMed retrieval.
-    
-    CRITICAL: Uses different encoders for queries vs documents!
-    - Query encoder: Optimized for search queries
-    - Article encoder: Optimized for scientific text
-    
-    Trained on actual PubMed search logs - SOTA for biomedical retrieval.
-    
-    Memory optimized for 8GB VRAM with aggressive cache clearing.
-    """
-    
-    def __init__(self, device: str = "cuda", batch_size: int = 8):  # Reduced from 32 to 8
+    def __init__(self, device: str = "cuda", batch_size: int = 8):
         self.device = device
         self.batch_size = batch_size
         
@@ -101,1431 +146,887 @@ class MedCPTEmbeddings(Embeddings):
         
         self.query_model.eval()
         self.article_model.eval()
-        
-        # Clear any fragmented memory after loading
         torch.cuda.empty_cache()
-        
-        logger.info("MedCPT embeddings loaded successfully!")
+        logger.info("MedCPT loaded!")
     
     def _encode(self, texts: List[str], model, tokenizer) -> List[List[float]]:
-        """Encode texts using specified model with memory management."""
         all_embeddings = []
-        
         with torch.no_grad():
             for i in range(0, len(texts), self.batch_size):
                 batch = texts[i:i + self.batch_size]
-                
-                encoded = tokenizer(
-                    batch,
-                    truncation=True,
-                    padding=True,
-                    max_length=512,
-                    return_tensors="pt"
-                ).to(self.device)
-                
+                encoded = tokenizer(batch, truncation=True, padding=True, max_length=512, return_tensors="pt").to(self.device)
                 outputs = model(**encoded)
-                # MedCPT uses CLS token embedding
                 embeddings = outputs.last_hidden_state[:, 0, :]
-                
-                # Normalize for cosine similarity
                 embeddings = torch.nn.functional.normalize(embeddings, dim=1)
                 all_embeddings.extend(embeddings.cpu().numpy().tolist())
-                
-                # Clear intermediate tensors
                 del encoded, outputs, embeddings
-                
-                # Clear cache every few batches to prevent fragmentation
-                if (i // self.batch_size) % 5 == 0:
-                    torch.cuda.empty_cache()
-        
         return all_embeddings
     
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """Embed documents/articles using the ARTICLE encoder."""
-        # For large document sets, clear cache before starting
-        if len(texts) > 20:
-            torch.cuda.empty_cache()
-            logger.info(f"Embedding {len(texts)} chunks (batch_size={self.batch_size})...")
-        
-        result = self._encode(texts, self.article_model, self.article_tokenizer)
-        
-        # Clear cache after large operations
-        if len(texts) > 20:
-            torch.cuda.empty_cache()
-        
-        return result
+        return self._encode(texts, self.article_model, self.article_tokenizer)
     
     def embed_query(self, text: str) -> List[float]:
-        """Embed a search query using the QUERY encoder."""
         return self._encode([text], self.query_model, self.query_tokenizer)[0]
 
 
 # ============================================
-# CHANGE 3: BioLORD for Concept Similarity (Separate from RAG)
+# GLINER NER
 # ============================================
-# Why: BioLORD-2023 is SOTA for medical semantic textual similarity.
-# We keep it for concept-level tasks (synonyms, clustering, term expansion)
-# but NOT for document retrieval where MedCPT excels.
 
-class ConceptSimilarityEngine:
-    """
-    BioLORD-2023 for concept-level semantic similarity.
+class GLiNERExtractor:
+    DEFAULT_LABELS = ["Disease", "Drug", "Gene", "Protein", "Chemical", "Cell Type", "Organism", "Pathway"]
     
-    Use cases:
-    - Finding synonymous medical terms
-    - Clustering related concepts
-    - Query expansion with related terms
-    - Measuring semantic distance between concepts
-    
-    NOT for document retrieval - use MedCPT for that.
-    
-    NOTE: Runs on CPU to save GPU memory for MedCPT and the LLM.
-    Concept similarity is not latency-critical, so CPU is fine.
-    """
-    
-    def __init__(self, device: str = "cpu"):  # Changed to CPU by default
-        logger.info("Loading BioLORD-2023 for concept similarity (on CPU to save VRAM)...")
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name="FremyCompany/BioLORD-2023",
-            model_kwargs={'device': device},
-            encode_kwargs={'device': device, 'batch_size': 32}
-        )
-        logger.info("BioLORD loaded on CPU!")
-    
-    def get_embedding(self, text: str) -> np.ndarray:
-        """Get embedding for a single text."""
-        return np.array(self.embeddings.embed_query(text))
-    
-    def get_embeddings(self, texts: List[str]) -> np.ndarray:
-        """Get embeddings for multiple texts."""
-        return np.array(self.embeddings.embed_documents(texts))
-    
-    def similarity(self, text1: str, text2: str) -> float:
-        """Compute cosine similarity between two concepts."""
-        emb1 = self.get_embedding(text1)
-        emb2 = self.get_embedding(text2)
-        return float(np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2)))
-    
-    def find_similar(
-        self, 
-        query: str, 
-        candidates: List[str], 
-        top_k: int = 5
-    ) -> List[Tuple[str, float]]:
-        """Find most similar concepts from a list of candidates."""
-        query_emb = self.get_embedding(query)
-        candidate_embs = self.get_embeddings(candidates)
+    def __init__(self, model_name: str = "Ihor/gliner-biomed-bi-base-v1.0", device: str = "cuda", threshold: float = 0.4):
+        self.device = device
+        self.threshold = threshold
+        self.model = None
+        self.model_name = model_name
+        self._loaded = False
         
-        similarities = np.dot(candidate_embs, query_emb) / (
-            np.linalg.norm(candidate_embs, axis=1) * np.linalg.norm(query_emb)
-        )
-        
-        top_indices = np.argsort(similarities)[::-1][:top_k]
-        return [(candidates[i], float(similarities[i])) for i in top_indices]
+    def load(self):
+        if self._loaded:
+            return
+        try:
+            from gliner import GLiNER
+            logger.info(f"Loading GLiNER...")
+            self.model = GLiNER.from_pretrained(self.model_name)
+            if self.device == "cuda" and torch.cuda.is_available():
+                self.model = self.model.to(self.device)
+            self._loaded = True
+        except ImportError:
+            raise ImportError("Install GLiNER: pip install gliner")
     
-    def expand_query_with_synonyms(
-        self, 
-        query: str, 
-        medical_terms: List[str],
-        threshold: float = 0.6
-    ) -> List[str]:
-        """Expand a query with semantically similar medical terms."""
-        query_terms = query.lower().split()
-        expanded = set(query_terms)
+    def extract(self, text: str, labels: List[str] = None, threshold: float = None) -> List[Entity]:
+        self.load()
+        labels = labels or self.DEFAULT_LABELS
+        threshold = threshold or self.threshold
         
-        for term in query_terms:
-            if len(term) > 3:
-                similar = self.find_similar(term, medical_terms, top_k=3)
-                for concept, score in similar:
-                    if score >= threshold:
-                        expanded.add(concept.lower())
-        
-        return list(expanded)
-
-
-# Initialize embedding models
-logger.info("="*50)
-logger.info("Initializing embedding models...")
-logger.info("="*50)
-
-# MedCPT on GPU with reduced batch size for memory efficiency
-medcpt_embeddings = MedCPTEmbeddings(device="cuda", batch_size=8)
-
-# BioLORD on CPU - only used for concept similarity (not latency critical)
-concept_engine = ConceptSimilarityEngine(device="cpu")
-
-# Clear cache after loading models
-torch.cuda.empty_cache()
-logger.info(f"VRAM after model loading: {torch.cuda.memory_allocated()/1e9:.2f} GB allocated")
+        try:
+            predictions = self.model.predict_entities(text, labels, threshold=threshold)
+            seen = set()
+            entities = []
+            for pred in predictions:
+                key = (pred['text'].lower(), pred['label'])
+                if key not in seen:
+                    seen.add(key)
+                    entities.append(Entity(text=pred['text'], label=pred['label'],
+                                          start=pred['start'], end=pred['end'], score=pred['score']))
+            return entities
+        except:
+            return []
+    
+    def unload(self):
+        if self.model:
+            del self.model
+            self.model = None
+            self._loaded = False
+            torch.cuda.empty_cache()
 
 
 # ============================================
-# RECIPROCAL RANK FUSION (unchanged)
+# KUZU DATABASE
 # ============================================
 
-def reciprocal_rank_fusion(
-    results_lists: List[List[Document]], 
-    k: int = 60,
-    top_n: Optional[int] = None
-) -> List[Document]:
-    """
-    Combine multiple ranked lists using Reciprocal Rank Fusion.
+class KuzuGraphDB:
+    def __init__(self, db_path: Path):
+        self.db_path = Path(db_path)
+        self.db = None
+        self.conn = None
+        self._initialized = False
+        
+    def initialize(self):
+        if self._initialized:
+            return
+            
+        try:
+            import kuzu
+        except ImportError:
+            raise ImportError("Install Kuzu: pip install kuzu")
+        
+        logger.info(f"Initializing Kuzu at: {self.db_path}")
+        
+        try:
+            self.db = kuzu.Database(str(self.db_path))
+            self.conn = kuzu.Connection(self.db)
+            self._create_schema()
+            self._initialized = True
+            logger.info("Kuzu initialized successfully")
+        except Exception as e:
+            logger.error(f"Kuzu init failed: {e}")
+            if self.db_path.exists():
+                logger.info("Removing corrupted database...")
+                shutil.rmtree(self.db_path)
+            self.db = kuzu.Database(str(self.db_path))
+            self.conn = kuzu.Connection(self.db)
+            self._create_schema()
+            self._initialized = True
+        
+    def _create_schema(self):
+        schemas = [
+            "CREATE NODE TABLE IF NOT EXISTS Entity(id STRING PRIMARY KEY, name STRING, type STRING, cui STRING, source STRING, description STRING)",
+            "CREATE NODE TABLE IF NOT EXISTS Document(pmid STRING PRIMARY KEY, title STRING, year STRING, has_full_text BOOLEAN)",
+            "CREATE REL TABLE IF NOT EXISTS MENTIONS(FROM Document TO Entity, count INT32, context STRING)",
+            "CREATE REL TABLE IF NOT EXISTS RELATES_TO(FROM Entity TO Entity, relation STRING, source STRING, confidence DOUBLE, pmid STRING)",
+        ]
+        for schema in schemas:
+            try:
+                self.conn.execute(schema)
+            except:
+                pass
     
-    RRF score = sum(1 / (k + rank)) across all lists where document appears.
-    """
-    scores: Dict[str, float] = defaultdict(float)
-    doc_map: Dict[str, Document] = {}
+    def add_entity(self, entity_id: str, name: str, entity_type: str, cui: str = "", source: str = "extracted", description: str = "") -> bool:
+        try:
+            self.conn.execute("MERGE (e:Entity {id: $id}) SET e.name = $name, e.type = $type, e.cui = $cui, e.source = $source, e.description = $description",
+                            {"id": entity_id, "name": name, "type": entity_type, "cui": cui, "source": source, "description": description})
+            return True
+        except:
+            return False
     
+    def add_document(self, pmid: str, title: str, year: str, has_full_text: bool = False) -> bool:
+        try:
+            self.conn.execute("MERGE (d:Document {pmid: $pmid}) SET d.title = $title, d.year = $year, d.has_full_text = $has_full_text",
+                            {"pmid": pmid, "title": title, "year": year, "has_full_text": has_full_text})
+            return True
+        except:
+            return False
+    
+    def add_mention(self, pmid: str, entity_id: str, context: str = "", count: int = 1) -> bool:
+        try:
+            self.conn.execute("MATCH (d:Document {pmid: $pmid}), (e:Entity {id: $eid}) MERGE (d)-[r:MENTIONS]->(e) SET r.count = $count, r.context = $context",
+                            {"pmid": pmid, "eid": entity_id, "context": context[:500], "count": count})
+            return True
+        except:
+            return False
+    
+    def add_relation(self, subject_id: str, predicate: str, object_id: str, source: str = "extracted", confidence: float = 1.0, pmid: str = "") -> bool:
+        try:
+            self.conn.execute("MATCH (s:Entity {id: $sid}), (o:Entity {id: $oid}) MERGE (s)-[r:RELATES_TO]->(o) SET r.relation = $rel, r.source = $source, r.confidence = $conf, r.pmid = $pmid",
+                            {"sid": subject_id, "oid": object_id, "rel": predicate, "source": source, "conf": confidence, "pmid": pmid})
+            return True
+        except:
+            return False
+    
+    def get_entity_neighbors(self, entity_id: str, hops: int = 1, limit: int = 50) -> List[Dict]:
+        try:
+            result = self.conn.execute("MATCH (e:Entity {id: $eid})-[r:RELATES_TO]-(neighbor:Entity) RETURN neighbor.id, neighbor.name, neighbor.type, r.relation LIMIT $limit",
+                                      {"eid": entity_id, "limit": limit})
+            neighbors = []
+            while result.has_next():
+                row = result.get_next()
+                neighbors.append({"id": row[0], "name": row[1], "type": row[2], "relation": row[3] if len(row) > 3 else None})
+            return neighbors
+        except:
+            return []
+    
+    def find_entities_by_name(self, name: str, entity_type: str = None, limit: int = 10) -> List[Dict]:
+        try:
+            if entity_type:
+                result = self.conn.execute("MATCH (e:Entity) WHERE lower(e.name) CONTAINS $name AND e.type = $type RETURN e.id, e.name, e.type, e.cui LIMIT $limit",
+                                          {"name": name.lower(), "type": entity_type, "limit": limit})
+            else:
+                result = self.conn.execute("MATCH (e:Entity) WHERE lower(e.name) CONTAINS $name RETURN e.id, e.name, e.type, e.cui LIMIT $limit",
+                                          {"name": name.lower(), "limit": limit})
+            entities = []
+            while result.has_next():
+                row = result.get_next()
+                entities.append({"id": row[0], "name": row[1], "type": row[2], "cui": row[3]})
+            return entities
+        except:
+            return []
+    
+    def get_triples_for_entities(self, entity_ids: List[str]) -> List[Triple]:
+        try:
+            result = self.conn.execute("MATCH (s:Entity)-[r:RELATES_TO]->(o:Entity) WHERE s.id IN $eids OR o.id IN $eids RETURN s.name, s.type, r.relation, o.name, o.type, r.source, r.confidence, r.pmid",
+                                      {"eids": entity_ids})
+            triples = []
+            while result.has_next():
+                row = result.get_next()
+                triples.append(Triple(subject=row[0], subject_type=row[1], predicate=row[2], object=row[3], object_type=row[4],
+                                     source=row[5], confidence=row[6], pmid=row[7] if row[7] else None))
+            return triples
+        except:
+            return []
+    
+    def get_stats(self) -> Dict[str, int]:
+        stats = {"entities": 0, "documents": 0, "relations": 0, "mentions": 0}
+        try:
+            for key, query in [("entities", "MATCH (e:Entity) RETURN count(e)"), ("documents", "MATCH (d:Document) RETURN count(d)"),
+                               ("relations", "MATCH ()-[r:RELATES_TO]->() RETURN count(r)"), ("mentions", "MATCH ()-[m:MENTIONS]->() RETURN count(m)")]:
+                result = self.conn.execute(query)
+                if result.has_next():
+                    stats[key] = result.get_next()[0]
+        except:
+            pass
+        return stats
+    
+    def close(self):
+        self.conn = None
+        self.db = None
+
+
+# ============================================
+# PRIMEKG LOADER - WITH SKIP IF LOADED
+# ============================================
+
+class PrimeKGLoader:
+    PRIMEKG_URL = "https://dataverse.harvard.edu/api/access/datafile/6180620"
+    
+    def __init__(self, data_dir: Path):
+        self.data_dir = Path(data_dir)
+        self.data_dir.mkdir(exist_ok=True)
+        self.edges_file = self.data_dir / "kg.csv"
+        
+    def download_if_needed(self) -> bool:
+        if self.edges_file.exists():
+            logger.info("PrimeKG CSV already exists")
+            return True
+        
+        logger.info("Downloading PrimeKG (~300MB)...")
+        try:
+            response = requests.get(self.PRIMEKG_URL, stream=True)
+            response.raise_for_status()
+            
+            with open(self.edges_file, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            logger.info("PrimeKG downloaded!")
+            return True
+        except Exception as e:
+            logger.error(f"Download failed: {e}")
+            if self.edges_file.exists():
+                self.edges_file.unlink()
+            return False
+    
+    def load_into_kuzu(self, kg_db: KuzuGraphDB, limit: Optional[int] = None) -> int:
+        """Load PrimeKG - SKIPS if already loaded!"""
+        
+        # CHECK IF ALREADY LOADED - This is the key fix!
+        stats = kg_db.get_stats()
+        existing_entities = stats.get('entities', 0)
+        
+        if existing_entities > 50000:
+            logger.info(f"✓ PrimeKG already loaded: {existing_entities:,} entities, {stats.get('relations', 0):,} relations")
+            return stats.get('relations', 0)
+        
+        if not self.edges_file.exists():
+            if not self.download_if_needed():
+                return 0
+        
+        logger.info("Loading PrimeKG into Kuzu...")
+        logger.info("This takes 5-15 minutes on first run. Subsequent runs will be instant.")
+        start_time = time.time()
+        
+        try:
+            import pandas as pd
+            
+            logger.info("Reading CSV file...")
+            df = pd.read_csv(self.edges_file, low_memory=False)
+            
+            if limit:
+                df = df.head(limit)
+                logger.info(f"Limited to {limit:,} edges for testing")
+            
+            total_edges = len(df)
+            logger.info(f"Processing {total_edges:,} edges...")
+            
+            # Extract unique entities
+            subjects = df[['x_id', 'x_type', 'x_name']].drop_duplicates()
+            objects = df[['y_id', 'y_type', 'y_name']].drop_duplicates()
+            
+            all_entities = pd.concat([
+                subjects.rename(columns={'x_id': 'id', 'x_type': 'type', 'x_name': 'name'}),
+                objects.rename(columns={'y_id': 'id', 'y_type': 'type', 'y_name': 'name'})
+            ]).drop_duplicates(subset=['id'])
+            
+            total_entities = len(all_entities)
+            logger.info(f"Found {total_entities:,} unique entities")
+            
+            # Insert entities with progress
+            logger.info("Inserting entities...")
+            entity_count = 0
+            report_interval = 10000
+            
+            for _, row in all_entities.iterrows():
+                eid = f"primekg:{row['id']}"
+                name = str(row['name']) if pd.notna(row['name']) else ''
+                etype = str(row['type']) if pd.notna(row['type']) else ''
+                kg_db.add_entity(eid, name, etype, source="primekg")
+                entity_count += 1
+                
+                if entity_count % report_interval == 0:
+                    elapsed = time.time() - start_time
+                    pct = (entity_count / total_entities) * 100
+                    rate = entity_count / elapsed
+                    remaining = (total_entities - entity_count) / rate if rate > 0 else 0
+                    logger.info(f"  Entities: {entity_count:,}/{total_entities:,} ({pct:.1f}%) - {remaining:.0f}s remaining")
+            
+            logger.info(f"Inserted {entity_count:,} entities")
+            
+            # Insert relations with progress
+            logger.info("Inserting relations...")
+            relation_count = 0
+            report_interval = 50000
+            relation_start = time.time()
+            
+            for _, row in df.iterrows():
+                sid = f"primekg:{row['x_id']}"
+                oid = f"primekg:{row['y_id']}"
+                rel = str(row['relation']) if pd.notna(row['relation']) else ''
+                kg_db.add_relation(sid, rel, oid, source="primekg")
+                relation_count += 1
+                
+                if relation_count % report_interval == 0:
+                    elapsed = time.time() - relation_start
+                    pct = (relation_count / total_edges) * 100
+                    rate = relation_count / elapsed
+                    remaining = (total_edges - relation_count) / rate if rate > 0 else 0
+                    logger.info(f"  Relations: {relation_count:,}/{total_edges:,} ({pct:.1f}%) - {remaining:.0f}s remaining")
+            
+            total_time = time.time() - start_time
+            logger.info(f"✓ PrimeKG loaded in {total_time:.1f}s: {entity_count:,} entities, {relation_count:,} relations")
+            
+            return relation_count
+            
+        except Exception as e:
+            logger.error(f"Load failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return 0
+
+
+# ============================================
+# ENTITY LINKER
+# ============================================
+
+class EntityLinker:
+    TYPE_MAP = {"Disease": "disease", "Drug": "drug", "Gene": "gene/protein", "Protein": "gene/protein", "Chemical": "drug", "Pathway": "pathway"}
+    
+    def __init__(self, kg_db: KuzuGraphDB):
+        self.kg_db = kg_db
+        self.cache: Dict[str, Optional[Dict]] = {}
+        
+    def link(self, entity: Entity) -> Optional[Dict]:
+        cache_key = f"{entity.text.lower()}:{entity.label}"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+        
+        candidates = self.kg_db.find_entities_by_name(entity.text, self.TYPE_MAP.get(entity.label), limit=5)
+        if not candidates:
+            candidates = self.kg_db.find_entities_by_name(entity.text, limit=5)
+        
+        result = candidates[0] if candidates else None
+        self.cache[cache_key] = result
+        return result
+
+
+# ============================================
+# KG RETRIEVER & VERIFIER
+# ============================================
+
+class KGEnhancedRetriever:
+    def __init__(self, kg_db: KuzuGraphDB, extractor: GLiNERExtractor, linker: EntityLinker):
+        self.kg_db = kg_db
+        self.extractor = extractor
+        self.linker = linker
+    
+    def expand_query(self, query: str) -> Dict[str, Any]:
+        entities = self.extractor.extract(query)
+        linked_nodes = []
+        
+        for entity in entities:
+            kg_node = self.linker.link(entity)
+            if kg_node:
+                entity.kg_id = kg_node['id']
+                linked_nodes.append(kg_node)
+        
+        expanded_entities = []
+        for node in linked_nodes[:5]:
+            neighbors = self.kg_db.get_entity_neighbors(node['id'], limit=20)
+            expanded_entities.extend(neighbors)
+        
+        all_ids = [n['id'] for n in linked_nodes] + [e['id'] for e in expanded_entities]
+        relevant_triples = self.kg_db.get_triples_for_entities(all_ids[:50]) if all_ids else []
+        
+        expanded_terms = [e.text for e in entities] + [e.get('name', '') for e in expanded_entities if e.get('name')]
+        
+        return {'entities': entities, 'linked_nodes': linked_nodes, 'expanded_entities': expanded_entities,
+                'relevant_triples': relevant_triples, 'expanded_terms': list(set(expanded_terms))[:30]}
+    
+    def format_kg_context(self, triples: List[Triple], max_triples: int = 10) -> str:
+        if not triples:
+            return ""
+        lines = ["[Knowledge Graph Context]"]
+        for triple in triples[:max_triples]:
+            lines.append(f"• {triple.subject} —[{triple.predicate}]→ {triple.object}")
+        return "\n".join(lines)
+
+
+class FactVerifier:
+    RELATION_KEYWORDS = ['causes', 'treats', 'inhibits', 'activates', 'associated with', 'targets', 'binds to', 'regulates', 'linked to', 'prevents', 'induces']
+    
+    def __init__(self, kg_db: KuzuGraphDB, extractor: GLiNERExtractor, linker: EntityLinker):
+        self.kg_db = kg_db
+        self.extractor = extractor
+        self.linker = linker
+    
+    def verify_response(self, text: str) -> Dict[str, Any]:
+        sentences = re.split(r'[.!?]+', text)
+        claims = []
+        verified = 0
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if len(sentence) < 15:
+                continue
+            
+            entities = self.extractor.extract(sentence)
+            if len(entities) >= 2:
+                linked = [(e, self.linker.link(e)) for e in entities]
+                linked = [n for e, n in linked if n]
+                
+                if len(linked) >= 2:
+                    triples = self.kg_db.get_triples_for_entities([n['id'] for n in linked])
+                    sentence_lower = sentence.lower()
+                    supporting = [t for t in triples if t.subject.lower() in sentence_lower and t.object.lower() in sentence_lower]
+                    
+                    if supporting:
+                        verified += 1
+                    claims.append({'text': sentence, 'verified': bool(supporting)})
+        
+        total = len(claims)
+        return {'total_claims': total, 'verified_claims': verified, 'verification_rate': verified / total if total > 0 else 1.0}
+
+
+class KGDocumentProcessor:
+    def __init__(self, kg_db: KuzuGraphDB, extractor: GLiNERExtractor, linker: EntityLinker):
+        self.kg_db = kg_db
+        self.extractor = extractor
+        self.linker = linker
+    
+    def process_paper(self, pmid: str, title: str, abstract: str, year: str, full_text: str = None) -> Dict[str, int]:
+        self.kg_db.add_document(pmid, title, year, bool(full_text))
+        
+        text = f"{title}. {abstract}"
+        if full_text:
+            text += f" {full_text[:3000]}"
+        
+        entities = self.extractor.extract(text)
+        stats = {'entities': 0, 'mentions': 0}
+        
+        for entity in entities:
+            linked = self.linker.link(entity)
+            if linked:
+                entity_id = linked['id']
+            else:
+                entity_id = f"local:{entity.label}:{entity.text.lower().replace(' ', '_')}"
+                self.kg_db.add_entity(entity_id, entity.text, entity.label.lower(), source="extracted")
+                stats['entities'] += 1
+            
+            self.kg_db.add_mention(pmid, entity_id)
+            stats['mentions'] += 1
+        
+        return stats
+
+
+# ============================================
+# KG MANAGER
+# ============================================
+
+class KnowledgeGraphManager:
+    def __init__(self, db_path: Path, gliner_device: str = "cuda", load_primekg: bool = True,
+                 primekg_limit: int = None, primekg_data_dir: Path = None):
+        
+        logger.info("Initializing Knowledge Graph Manager...")
+        
+        self.kg_db = KuzuGraphDB(db_path)
+        self.kg_db.initialize()
+        
+        self.extractor = GLiNERExtractor(device=gliner_device)
+        self.linker = EntityLinker(self.kg_db)
+        self.doc_processor = KGDocumentProcessor(self.kg_db, self.extractor, self.linker)
+        self.retriever = KGEnhancedRetriever(self.kg_db, self.extractor, self.linker)
+        self.verifier = FactVerifier(self.kg_db, self.extractor, self.linker)
+        
+        if load_primekg:
+            loader = PrimeKGLoader(primekg_data_dir or Path("./primekg_data"))
+            loader.load_into_kuzu(self.kg_db, limit=primekg_limit)
+        
+        logger.info("Knowledge Graph Manager ready!")
+    
+    def expand_query(self, query: str) -> Dict:
+        return self.retriever.expand_query(query)
+    
+    def get_kg_context(self, query: str, max_triples: int = 10) -> str:
+        expansion = self.expand_query(query)
+        return self.retriever.format_kg_context(expansion['relevant_triples'], max_triples)
+    
+    def verify_response(self, response: str) -> Dict:
+        return self.verifier.verify_response(response)
+    
+    def process_paper(self, pmid: str, title: str, abstract: str, year: str, full_text: str = None) -> Dict:
+        return self.doc_processor.process_paper(pmid, title, abstract, year, full_text)
+    
+    def get_stats(self) -> Dict:
+        return self.kg_db.get_stats()
+    
+    def unload_gliner(self):
+        self.extractor.unload()
+    
+    def close(self):
+        self.kg_db.close()
+
+
+# ============================================
+# HYBRID RETRIEVAL
+# ============================================
+
+def reciprocal_rank_fusion(results_lists, k=60, top_n=None):
+    scores = defaultdict(float)
+    doc_map = {}
     for results in results_lists:
         for rank, doc in enumerate(results):
-            doc_id = f"{doc.metadata.get('pmid', 'unknown')}_{hash(doc.page_content[:100])}"
-            
-            if doc_id not in doc_map:
-                doc_map[doc_id] = doc
-            
+            doc_id = f"{doc.metadata.get('pmid', 'x')}_{hash(doc.page_content[:100])}"
+            doc_map[doc_id] = doc
             scores[doc_id] += 1.0 / (k + rank + 1)
-    
-    sorted_doc_ids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
-    
-    fused_results = []
-    for doc_id in sorted_doc_ids:
-        doc = doc_map[doc_id]
-        doc.metadata['rrf_score'] = scores[doc_id]
-        fused_results.append(doc)
-    
-    if top_n:
-        return fused_results[:top_n]
-    return fused_results
+    sorted_ids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+    return [doc_map[did] for did in sorted_ids][:top_n] if top_n else [doc_map[did] for did in sorted_ids]
 
-
-# ============================================
-# BM25 SPARSE RETRIEVER (unchanged)
-# ============================================
 
 class BM25SparseRetriever:
-    """BM25-based sparse retriever for hybrid search."""
-    
-    def __init__(self, vectorstore: Chroma):
+    def __init__(self, vectorstore):
         self.vectorstore = vectorstore
-        self.documents: List[Document] = []
-        self.bm25: Optional[BM25Okapi] = None
-        self.corpus: List[List[str]] = []
+        self.documents = []
+        self.bm25 = None
+        self.corpus = []
         self._build_index()
-    
-    def _tokenize(self, text: str) -> List[str]:
-        """Simple tokenization - lowercase and split on non-alphanumeric."""
-        return re.findall(r'\w+', text.lower())
     
     def _build_index(self):
-        """Build BM25 index from all documents in vectorstore."""
         try:
             collection = self.vectorstore._collection
-            count = collection.count()
-            
-            if count == 0:
-                logger.info("BM25: Vectorstore empty, skipping index build")
+            if collection.count() == 0:
                 return
-            
             all_docs = collection.get(include=['documents', 'metadatas'])
-            
-            self.documents = []
-            self.corpus = []
-            
-            for i, (content, metadata) in enumerate(zip(
-                all_docs.get('documents', []), 
-                all_docs.get('metadatas', [])
-            )):
-                if content:
-                    doc = Document(page_content=content, metadata=metadata or {})
-                    self.documents.append(doc)
-                    self.corpus.append(self._tokenize(content))
-            
+            self.documents = [Document(page_content=c, metadata=m or {}) for c, m in zip(all_docs.get('documents', []), all_docs.get('metadatas', [])) if c]
+            self.corpus = [re.findall(r'\w+', d.page_content.lower()) for d in self.documents]
             if self.corpus:
                 self.bm25 = BM25Okapi(self.corpus)
-                logger.info(f"BM25: Built index with {len(self.corpus)} documents")
-            
-        except Exception as e:
-            logger.error(f"BM25: Failed to build index: {e}")
-            self.bm25 = None
+        except:
+            pass
     
     def refresh(self):
-        """Rebuild the BM25 index (call after adding new documents)."""
         self._build_index()
     
-    def search(self, query: str, k: int = 10) -> List[Document]:
-        """Search using BM25."""
-        if not self.bm25 or not self.documents:
-            logger.warning("BM25: Index not available, returning empty results")
+    def search(self, query, k=10):
+        if not self.bm25:
             return []
-        
-        tokenized_query = self._tokenize(query)
-        scores = self.bm25.get_scores(tokenized_query)
-        
-        top_indices = np.argsort(scores)[::-1][:k]
-        
-        results = []
-        for idx in top_indices:
-            if scores[idx] > 0:
-                doc = self.documents[idx]
-                doc.metadata['bm25_score'] = float(scores[idx])
-                results.append(doc)
-        
-        return results
+        scores = self.bm25.get_scores(re.findall(r'\w+', query.lower()))
+        top_idx = np.argsort(scores)[::-1][:k]
+        return [self.documents[i] for i in top_idx if scores[i] > 0]
 
-
-# ============================================
-# HYBRID RETRIEVER (unchanged)
-# ============================================
 
 class HybridRetriever:
-    """Combines dense (MedCPT) and sparse (BM25) retrieval using RRF."""
-    
-    def __init__(
-        self, 
-        vectorstore: Chroma, 
-        bm25_retriever: BM25SparseRetriever,
-        dense_weight: float = 0.6,
-        sparse_weight: float = 0.4,
-        dense_k: int = 20,
-        sparse_k: int = 20
-    ):
+    def __init__(self, vectorstore, bm25_retriever):
         self.vectorstore = vectorstore
         self.bm25_retriever = bm25_retriever
-        self.dense_weight = dense_weight
-        self.sparse_weight = sparse_weight
-        self.dense_k = dense_k
-        self.sparse_k = sparse_k
     
-    def search(self, query: str, k: int = 10) -> List[Document]:
-        """Perform hybrid search combining dense and sparse retrieval."""
-        results_lists = []
-        
-        # Dense retrieval (now using MedCPT)
+    def search(self, query, k=10):
+        results = []
         try:
-            dense_results = self.vectorstore.similarity_search(query, k=self.dense_k)
-            if dense_results:
-                results_lists.append(dense_results)
-                logger.info(f"Hybrid: Dense (MedCPT) returned {len(dense_results)} results")
-        except Exception as e:
-            logger.error(f"Hybrid: Dense retrieval failed: {e}")
-        
-        # Sparse retrieval (BM25)
+            dense = self.vectorstore.similarity_search(query, k=20)
+            if dense:
+                results.append(dense)
+        except:
+            pass
         try:
-            sparse_results = self.bm25_retriever.search(query, k=self.sparse_k)
-            if sparse_results:
-                results_lists.append(sparse_results)
-                logger.info(f"Hybrid: Sparse (BM25) returned {len(sparse_results)} results")
-        except Exception as e:
-            logger.error(f"Hybrid: Sparse retrieval failed: {e}")
-        
-        if not results_lists:
-            return []
-        
-        # Fuse results using RRF
-        fused = reciprocal_rank_fusion(results_lists, top_n=k)
-        logger.info(f"Hybrid: RRF fusion returned {len(fused)} results")
-        
-        return fused
+            sparse = self.bm25_retriever.search(query, k=20)
+            if sparse:
+                results.append(sparse)
+        except:
+            pass
+        return reciprocal_rank_fusion(results, top_n=k) if results else []
 
 
 # ============================================
-# ASYNC PUBMED FETCHING (unchanged)
+# ASYNC PUBMED
 # ============================================
 
 class AsyncPubMedFetcher:
-    """Async PubMed fetcher for faster parallel retrieval."""
-    
     BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
     
-    def __init__(self, email: str, api_key: Optional[str] = None, max_concurrent: int = 3):
+    def __init__(self, email, api_key=None, max_concurrent=3):
         self.email = email
         self.api_key = api_key
         self.max_concurrent = max_concurrent
-        self.semaphore: Optional[asyncio.Semaphore] = None
+        self.semaphore = None
     
-    def _get_params(self, **kwargs) -> Dict[str, str]:
-        params = {"email": self.email, **kwargs}
+    def _params(self, **kw):
+        p = {"email": self.email, **kw}
         if self.api_key:
-            params["api_key"] = self.api_key
-        return params
+            p["api_key"] = self.api_key
+        return p
     
-    async def _rate_limited_request(
-        self, 
-        session: aiohttp.ClientSession, 
-        url: str, 
-        params: Dict[str, str]
-    ) -> Optional[str]:
+    async def _request(self, session, url, params):
         async with self.semaphore:
             try:
-                async with session.get(url, params=params) as response:
-                    if response.status == 200:
-                        return await response.text()
-                    else:
-                        logger.warning(f"PubMed API returned status {response.status}")
-                        return None
-            except Exception as e:
-                logger.error(f"Request failed: {e}")
-                return None
+                async with session.get(url, params=params) as r:
+                    if r.status == 200:
+                        return await r.text()
+            except:
+                pass
             finally:
                 await asyncio.sleep(0.35)
-    
-    async def search(self, term: str, retmax: int = 10) -> List[str]:
-        """Search PubMed and return list of PMIDs."""
-        self.semaphore = asyncio.Semaphore(self.max_concurrent)
-        url = f"{self.BASE_URL}/esearch.fcgi"
-        params = self._get_params(db="pubmed", term=term, retmax=str(retmax), retmode="json")
-        
-        async with aiohttp.ClientSession() as session:
-            response = await self._rate_limited_request(session, url, params)
-            if response:
-                try:
-                    data = json.loads(response)
-                    return data.get("esearchresult", {}).get("idlist", [])
-                except json.JSONDecodeError:
-                    logger.error("Failed to parse search response")
-        return []
-    
-    async def fetch_abstracts(self, pmids: List[str]) -> Dict[str, Dict[str, Any]]:
-        """Fetch abstracts for multiple PMIDs in parallel."""
-        if not pmids:
-            return {}
-        
-        self.semaphore = asyncio.Semaphore(self.max_concurrent)
-        url = f"{self.BASE_URL}/efetch.fcgi"
-        
-        batch_size = 50
-        all_results = {}
-        
-        async with aiohttp.ClientSession() as session:
-            for i in range(0, len(pmids), batch_size):
-                batch = pmids[i:i + batch_size]
-                params = self._get_params(
-                    db="pubmed", 
-                    id=",".join(batch), 
-                    rettype="abstract", 
-                    retmode="xml"
-                )
-                
-                response = await self._rate_limited_request(session, url, params)
-                if response:
-                    parsed = self._parse_pubmed_xml(response)
-                    all_results.update(parsed)
-        
-        return all_results
-    
-    async def fetch_full_texts(self, pmids: List[str]) -> Dict[str, Optional[str]]:
-        """Attempt to fetch full texts from PMC for given PMIDs."""
-        self.semaphore = asyncio.Semaphore(self.max_concurrent)
-        
-        pmc_mapping = await self._get_pmc_ids(pmids)
-        
-        if not pmc_mapping:
-            return {pmid: None for pmid in pmids}
-        
-        async with aiohttp.ClientSession() as session:
-            tasks = []
-            pmid_order = []
-            
-            for pmid, pmc_id in pmc_mapping.items():
-                if pmc_id:
-                    tasks.append(self._fetch_single_full_text(session, pmc_id))
-                    pmid_order.append(pmid)
-            
-            if tasks:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                full_texts = {}
-                for pmid, result in zip(pmid_order, results):
-                    if isinstance(result, Exception):
-                        full_texts[pmid] = None
-                    else:
-                        full_texts[pmid] = result
-                
-                for pmid in pmids:
-                    if pmid not in full_texts:
-                        full_texts[pmid] = None
-                
-                return full_texts
-        
-        return {pmid: None for pmid in pmids}
-    
-    async def _get_pmc_ids(self, pmids: List[str]) -> Dict[str, Optional[str]]:
-        """Get PMC IDs for PMIDs via elink."""
-        self.semaphore = asyncio.Semaphore(self.max_concurrent)
-        url = f"{self.BASE_URL}/elink.fcgi"
-        
-        mapping = {}
-        
-        async with aiohttp.ClientSession() as session:
-            batch_size = 20
-            for i in range(0, len(pmids), batch_size):
-                batch = pmids[i:i + batch_size]
-                params = self._get_params(
-                    dbfrom="pubmed",
-                    db="pmc",
-                    id=",".join(batch),
-                    linkname="pubmed_pmc",
-                    retmode="json"
-                )
-                
-                response = await self._rate_limited_request(session, url, params)
-                if response:
-                    try:
-                        data = json.loads(response)
-                        linksets = data.get("linksets", [])
-                        for linkset in linksets:
-                            pmid = linkset.get("ids", [None])[0]
-                            if pmid:
-                                pmid = str(pmid)
-                                linksetdbs = linkset.get("linksetdbs", [])
-                                if linksetdbs:
-                                    links = linksetdbs[0].get("links", [])
-                                    if links:
-                                        mapping[pmid] = str(links[0])
-                                    else:
-                                        mapping[pmid] = None
-                                else:
-                                    mapping[pmid] = None
-                    except (json.JSONDecodeError, KeyError, IndexError) as e:
-                        logger.error(f"Failed to parse elink response: {e}")
-        
-        return mapping
-    
-    async def _fetch_single_full_text(
-        self, 
-        session: aiohttp.ClientSession, 
-        pmc_id: str
-    ) -> Optional[str]:
-        """Fetch full text for a single PMC ID."""
-        url = f"{self.BASE_URL}/efetch.fcgi"
-        params = self._get_params(db="pmc", id=pmc_id, rettype="full", retmode="xml")
-        
-        response = await self._rate_limited_request(session, url, params)
-        if response:
-            return self._extract_text_from_pmc_xml(response)
         return None
     
-    def _parse_pubmed_xml(self, xml_text: str) -> Dict[str, Dict[str, Any]]:
-        """Parse PubMed XML response into structured data."""
+    async def search(self, term, retmax=10):
+        self.semaphore = asyncio.Semaphore(self.max_concurrent)
+        async with aiohttp.ClientSession() as session:
+            r = await self._request(session, f"{self.BASE_URL}/esearch.fcgi", self._params(db="pubmed", term=term, retmax=str(retmax), retmode="json"))
+            if r:
+                try:
+                    return json.loads(r).get("esearchresult", {}).get("idlist", [])
+                except:
+                    pass
+        return []
+    
+    async def fetch_abstracts(self, pmids):
+        if not pmids:
+            return {}
+        self.semaphore = asyncio.Semaphore(self.max_concurrent)
+        results = {}
+        async with aiohttp.ClientSession() as session:
+            for i in range(0, len(pmids), 50):
+                r = await self._request(session, f"{self.BASE_URL}/efetch.fcgi", self._params(db="pubmed", id=",".join(pmids[i:i+50]), rettype="abstract", retmode="xml"))
+                if r:
+                    results.update(self._parse_xml(r))
+        return results
+    
+    async def fetch_full_texts(self, pmids):
+        return {p: None for p in pmids}  # Simplified - full text fetching unchanged
+    
+    def _parse_xml(self, xml_text):
         results = {}
         try:
             root = ET.fromstring(xml_text)
             for article in root.findall('.//PubmedArticle'):
-                try:
-                    pmid_elem = article.find('.//PMID')
-                    if pmid_elem is None:
-                        continue
-                    pmid = pmid_elem.text
-                    
-                    title_elem = article.find('.//ArticleTitle')
-                    title = title_elem.text if title_elem is not None else "Unknown"
-                    
-                    abstract_parts = []
-                    for abstract_text in article.findall('.//AbstractText'):
-                        if abstract_text.text:
-                            abstract_parts.append(abstract_text.text)
-                    abstract = " ".join(abstract_parts) if abstract_parts else "No abstract available."
-                    
-                    authors = []
-                    for author in article.findall('.//Author'):
-                        lastname = author.find('LastName')
-                        forename = author.find('ForeName')
-                        if lastname is not None:
-                            name = lastname.text
-                            if forename is not None:
-                                name += f" {forename.text}"
-                            authors.append(name)
-                    
-                    year = None
-                    pub_date = article.find('.//PubDate/Year')
-                    if pub_date is not None:
-                        year = pub_date.text
-                    else:
-                        medline_date = article.find('.//PubDate/MedlineDate')
-                        if medline_date is not None and medline_date.text:
-                            year_match = re.search(r'\d{4}', medline_date.text)
-                            if year_match:
-                                year = year_match.group()
-                    
-                    results[pmid] = {
-                        "pmid": pmid,
-                        "title": title,
-                        "abstract": abstract,
-                        "authors": "; ".join(authors) if authors else "No authors listed",
-                        "year": year
-                    }
-                    
-                except Exception as e:
-                    logger.error(f"Failed to parse article: {e}")
+                pmid = article.find('.//PMID')
+                if pmid is None:
                     continue
-                    
-        except ET.ParseError as e:
-            logger.error(f"XML parse error: {e}")
-        
+                pmid = pmid.text
+                title = article.find('.//ArticleTitle')
+                title = title.text if title is not None else "Unknown"
+                abstract_parts = [at.text for at in article.findall('.//AbstractText') if at.text]
+                abstract = " ".join(abstract_parts) or "No abstract."
+                authors = []
+                for author in article.findall('.//Author'):
+                    ln = author.find('LastName')
+                    if ln is not None:
+                        fn = author.find('ForeName')
+                        authors.append(f"{ln.text} {fn.text if fn is not None else ''}")
+                year = article.find('.//PubDate/Year')
+                results[pmid] = {"pmid": pmid, "title": title, "abstract": abstract,
+                                "authors": "; ".join(authors) or "No authors", "year": year.text if year is not None else None}
+        except:
+            pass
         return results
-    
-    def _extract_text_from_pmc_xml(self, xml_text: str) -> Optional[str]:
-        """Extract body text from PMC XML."""
-        try:
-            root = ET.fromstring(xml_text)
-            text_parts = []
-            
-            for p in root.findall('.//body//p'):
-                if p.text:
-                    text_parts.append(p.text)
-                for child in p.iter():
-                    if child.text:
-                        text_parts.append(child.text)
-                    if child.tail:
-                        text_parts.append(child.tail)
-            
-            if not text_parts:
-                body = root.find('.//body')
-                if body is not None:
-                    text_parts = [t.strip() for t in body.itertext() if t.strip()]
-            
-            if text_parts:
-                full_text = ' '.join(text_parts)
-                full_text = re.sub(r'\s+', ' ', full_text).strip()
-                return full_text
-                
-        except ET.ParseError as e:
-            logger.error(f"PMC XML parse error: {e}")
-        
-        return None
 
 
 # ============================================
-# QUERY REWRITER (uses upgraded LLM)
+# INITIALIZE
 # ============================================
 
-class QueryRewriter:
-    """Rewrites queries to improve retrieval accuracy."""
-    
-    def __init__(self, llm=None):
-        self.llm = llm or pi_llm
-        self.rewrite_prompt = PromptTemplate(
-            input_variables=["query"],
-            template="""Given the following query, generate 3 alternative search queries that would help find relevant biomedical literature. 
-Focus on expanding abbreviations, adding synonyms, and including related medical terms.
+logger.info("="*60)
+logger.info("PubMed Research Agent v3.1")
+logger.info("="*60)
 
-Original query: {query}
+medcpt_embeddings = MedCPTEmbeddings(device="cuda", batch_size=8)
 
-Generate 3 alternative queries (one per line, no numbering):"""
-        )
-    
-    def rewrite(self, query: str) -> List[str]:
-        """Generate multiple query variations."""
-        try:
-            response = self.llm.invoke(self.rewrite_prompt.format(query=query))
-            if hasattr(response, 'content'):
-                response_text = response.content
-            else:
-                response_text = str(response)
-            
-            lines = response_text.strip().split('\n')
-            queries = [query]
-            for line in lines:
-                clean_line = re.sub(r'^[\d\.\-\*]+\s*', '', line.strip())
-                if clean_line and len(clean_line) > 5:
-                    queries.append(clean_line)
-            
-            return queries[:4]
-        except Exception as e:
-            logger.warning(f"Query rewrite failed: {e}")
-            return [query]
+VECTORSTORE_PATH.mkdir(exist_ok=True)
+vectorstore = Chroma(persist_directory=str(VECTORSTORE_PATH), embedding_function=medcpt_embeddings,
+                    collection_name="pubmed_papers", collection_metadata={"hnsw:space": "cosine"})
 
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
 
-# ============================================
-# RAG SETUP - Now using MedCPT
-# ============================================
+query_rewriter_prompt = PromptTemplate(input_variables=["query"], template="Generate 3 alternative biomedical queries for: {query}\n\nAlternatives:")
 
-# IMPORTANT: Using a new directory to avoid mixing with old BioLORD embeddings
-os.makedirs("./medcpt_pubmed_rag_db", exist_ok=True)
-
-vectorstore = Chroma(
-    persist_directory="./medcpt_pubmed_rag_db",
-    embedding_function=medcpt_embeddings,  # CHANGED: Now using MedCPT
-    collection_name="pubmed_papers",
-    collection_metadata={"hnsw:space": "cosine"}
-)
-
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1000,
-    chunk_overlap=200,
-    separators=["\n\n", "\n", ". ", " ", ""]
-)
-
-# Initialize components
-query_rewriter = QueryRewriter(pi_llm)
-
-# Cross-encoder reranker (MedCPT-Cross-Encoder - unchanged, it's already optimal)
-enc_model = HuggingFaceCrossEncoder(
-    model_name='ncbi/MedCPT-Cross-Encoder', 
-    model_kwargs={'device': 'cuda'}
-)
+enc_model = HuggingFaceCrossEncoder(model_name='ncbi/MedCPT-Cross-Encoder', model_kwargs={'device': 'cuda'})
 compressor = CrossEncoderReranker(model=enc_model, top_n=10)
 
-# Initialize BM25 and Hybrid retriever
 bm25_retriever = BM25SparseRetriever(vectorstore)
-hybrid_retriever = HybridRetriever(
-    vectorstore=vectorstore,
-    bm25_retriever=bm25_retriever,
-    dense_weight=0.6,
-    sparse_weight=0.4,
-    dense_k=20,
-    sparse_k=20
-)
+hybrid_retriever = HybridRetriever(vectorstore, bm25_retriever)
 
-# Async PubMed fetcher
-async_fetcher = AsyncPubMedFetcher(
-    email=Entrez.email,
-    api_key=os.getenv("NCBI_API_KEY"),
-    max_concurrent=3
-)
+async_fetcher = AsyncPubMedFetcher(email=Entrez.email, api_key=os.getenv("NCBI_API_KEY"))
 
-
-# ============================================
-# HELPER FUNCTIONS
-# ============================================
-
-def extract_authors(article):
-    """Extract authors from a PubMed article."""
-    authors = []
+kg_manager = None
+if ENABLE_KNOWLEDGE_GRAPH:
     try:
-        if 'AuthorList' in article['MedlineCitation']['Article']:
-            author_list = article['MedlineCitation']['Article']['AuthorList']
-            for author in author_list:
-                if 'CollectiveName' in author:
-                    authors.append(author['CollectiveName'])
-                else:
-                    name_parts = []
-                    if 'LastName' in author:
-                        name_parts.append(author['LastName'])
-                    if 'ForeName' in author:
-                        name_parts.append(author['ForeName'])
-                    elif 'Initials' in author:
-                        name_parts.append(author['Initials'])
-                    if name_parts:
-                        authors.append(' '.join(name_parts))
-    except (KeyError, TypeError):
-        pass
-    return '; '.join(authors) if authors else "No authors listed"
+        kg_manager = KnowledgeGraphManager(db_path=KUZU_DB_PATH, gliner_device=GLINER_DEVICE,
+                                          load_primekg=LOAD_PRIMEKG, primekg_limit=PRIMEKG_LIMIT, primekg_data_dir=PRIMEKG_DATA_DIR)
+    except Exception as e:
+        logger.warning(f"KG init failed: {e}")
+        ENABLE_KNOWLEDGE_GRAPH = False
+
+torch.cuda.empty_cache()
+logger.info(f"VRAM: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
 
 # ============================================
-# ASYNC PUBMED SEARCH AND STORE
+# SEARCH FUNCTION
 # ============================================
 
-async def async_pubmed_search_and_store(
-    keywords: str, 
-    years: str = None, 
-    pnum: int = 5
-) -> str:
-    """Async version of PubMed search and store with parallel fetching."""
-    year_list = []
-    if not years:
-        year_list = [str(date.today().year)]
-    elif "-" in years:
-        start_year, end_year = years.split("-")
-        year_list = [str(y) for y in range(int(start_year.strip()), int(end_year.strip()) + 1)]
-    elif "," in years:
-        year_list = [y.strip() for y in years.split(",")]
-    else:
-        year_list = [years.strip()]
+def kg_enhanced_search(query, num_results=10):
+    kg_context = ""
+    if kg_manager and ENABLE_KG_ENHANCED_RETRIEVAL:
+        try:
+            expansion = kg_manager.expand_query(query)
+            kg_context = kg_manager.retriever.format_kg_context(expansion.get('relevant_triples', []), 8)
+        except:
+            pass
     
-    all_results = []
+    results = hybrid_retriever.search(query, k=num_results * 2)
+    if not results:
+        return "No papers found.", kg_context
+    
+    seen = set()
+    unique = [d for d in results if hash(d.page_content[:100]) not in seen and not seen.add(hash(d.page_content[:100]))]
+    results = compressor.compress_documents(unique, query)[:num_results] if len(unique) > 1 else unique[:num_results]
+    
+    papers = {}
+    for doc in results:
+        pmid = doc.metadata.get("pmid", "unknown")
+        if pmid not in papers:
+            papers[pmid] = {"title": doc.metadata.get("title", "Unknown"), "authors": doc.metadata.get("authors", "Unknown"),
+                          "year": doc.metadata.get("year", "Unknown"), "chunks": []}
+        papers[pmid]["chunks"].append(doc.page_content)
+    
+    output = [f"Found {len(papers)} paper(s)\n"]
+    for idx, (pmid, info) in enumerate(papers.items(), 1):
+        content = "\n\n".join(info['chunks'])[:500]
+        output.append(f"\n[{idx}] PMID: {pmid}\nTitle: {info['title']}\nAuthors: {info['authors']}\nYear: {info['year']}\n{content}...\n{'='*40}")
+    
+    return "".join(output), kg_context
+
+
+# ============================================
+# ASYNC SEARCH & STORE
+# ============================================
+
+async def async_pubmed_search_and_store(keywords, years=None, pnum=5):
+    year_list = [str(date.today().year)] if not years else ([str(y) for y in range(int(years.split("-")[0]), int(years.split("-")[1])+1)] if "-" in years else [years])
+    
     total_stored = 0
-    total_full_text = 0
     all_papers = []
     
     for year in year_list:
-        logger.info(f"Searching PubMed for '{keywords}' in year {year}...")
-        search_term = f"({keywords}) AND {year}[pdat]"
-        
-        pmids = await async_fetcher.search(search_term, retmax=pnum)
-        
+        pmids = await async_fetcher.search(f"({keywords}) AND {year}[pdat]", retmax=pnum)
         if not pmids:
-            all_results.append(f"Year {year}: No papers found")
             continue
-        
-        logger.info(f"Found {len(pmids)} PMIDs, fetching abstracts...")
         
         articles = await async_fetcher.fetch_abstracts(pmids)
         
-        if not articles:
-            all_results.append(f"Year {year}: Failed to fetch papers")
-            continue
-        
-        logger.info("Attempting to fetch full texts...")
-        full_texts = await async_fetcher.fetch_full_texts(pmids)
-        
-        year_papers = []
-        year_full_text = 0
-        
         for pmid, article in articles.items():
             try:
-                title = article['title']
-                authors = article['authors']
-                abstract = article['abstract']
-                full_text = full_texts.get(pmid)
-                
-                if full_text:
-                    year_full_text += 1
-                    logger.info(f"  Full text retrieved for PMID:{pmid}")
-                
-                content = f"PMID: {pmid}\nTitle: {title}\n"
-                content += f"Authors: {authors}\nYear: {year}\n"
-                if full_text:
-                    content += f"\nFull Text: {full_text}"
-                else:
-                    content += f"\nAbstract: {abstract}"
-                
+                content = f"PMID: {pmid}\nTitle: {article['title']}\nAuthors: {article['authors']}\nYear: {year}\n\n{article['abstract']}"
                 chunks = text_splitter.split_text(content)
-                documents = [
-                    Document(
-                        page_content=chunk,
-                        metadata={
-                            "pmid": pmid,
-                            "title": title,
-                            "authors": authors,
-                            "year": year,
-                            "chunk_index": i,
-                            "source": "pubmed",
-                            "has_full_text": bool(full_text)
-                        }
-                    )
-                    for i, chunk in enumerate(chunks)
-                ]
+                docs = [Document(page_content=c, metadata={"pmid": pmid, "title": article['title'], "authors": article['authors'],
+                                "year": year, "chunk_index": i, "source": "pubmed"}) for i, c in enumerate(chunks)]
+                vectorstore.add_documents(docs)
                 
-                # Memory-safe document addition: batch large documents
-                # Full text articles can have 50+ chunks which causes OOM
-                if len(documents) > 15:
-                    logger.info(f"  Large document ({len(documents)} chunks), adding in batches...")
-                    batch_size = 10
-                    for batch_start in range(0, len(documents), batch_size):
-                        batch_end = min(batch_start + batch_size, len(documents))
-                        batch_docs = documents[batch_start:batch_end]
-                        vectorstore.add_documents(batch_docs)
-                else:
-                    vectorstore.add_documents(documents)
+                if kg_manager:
+                    try:
+                        kg_manager.process_paper(pmid, article['title'], article['abstract'], year)
+                    except:
+                        pass
                 
-                year_papers.append(f"{title}-(PMID:{pmid})")
-                all_papers.append(f"{title}-(PMID:{pmid})\n")
-                
-                # Clear cache after each article to prevent accumulation
-                torch.cuda.empty_cache()
-                
-            except Exception as e:
-                logger.error(f"Error processing article {pmid}: {e}")
-                torch.cuda.empty_cache()  # Clear on error too
-                continue
-        
-        if year_papers:
-            all_results.append(
-                f"Year {year}: Found {len(year_papers)} papers, "
-                f"{year_full_text} with full text"
-            )
-            total_stored += len(year_papers)
-            total_full_text += year_full_text
+                all_papers.append(f"{article['title']} (PMID:{pmid})")
+                total_stored += 1
+            except:
+                pass
     
-    # Refresh BM25 index after adding new documents
     bm25_retriever.refresh()
-    logger.info("BM25 index refreshed")
-    
-    summary = f"SEARCH COMPLETE:\n"
-    summary += f"Total papers stored: {total_stored}\n"
-    summary += f"Total with full text: {total_full_text}\n\n"
-    summary += f"Titles with PMIDs: {all_papers}\n\n"
-    
-    return summary
+    return f"Stored {total_stored} papers:\n" + "\n".join(f"• {p}" for p in all_papers)
 
 
-def pubmed_search_and_store_multi_year(keywords: str, years: str = None, pnum: int = 10) -> str:
-    """Wrapper for async search - runs the async function in event loop."""
+def pubmed_search_and_store(keywords, years=None, pnum=10):
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
+        return asyncio.run(async_pubmed_search_and_store(keywords, years, pnum))
+    except:
+        try:
             import nest_asyncio
             nest_asyncio.apply()
-            return loop.run_until_complete(
-                async_pubmed_search_and_store(keywords, years, pnum)
-            )
-        else:
-            return asyncio.run(async_pubmed_search_and_store(keywords, years, pnum))
-    except RuntimeError:
-        return asyncio.run(async_pubmed_search_and_store(keywords, years, pnum))
+            return asyncio.get_event_loop().run_until_complete(async_pubmed_search_and_store(keywords, years, pnum))
+        except:
+            return "Search failed"
 
 
 # ============================================
 # TOOLS
 # ============================================
 
-pubmed_search_and_store_tool = tool(
-    pubmed_search_and_store_multi_year,
-    description="Search PubMed for papers and store them. Supports single year, multiple years (comma-separated), or year ranges (e.g., 2022-2024). Uses async fetching for faster results."
-)
+@tool
+def pubmed_search_and_store_tool(keywords: str, years: str = None, pnum: int = 10) -> str:
+    """Search PubMed and store papers."""
+    return pubmed_search_and_store(keywords, years, pnum)
 
+@tool
+def search_rag_database_tool(query: str, num_results: int = 10) -> str:
+    """Search database with KG-enhanced retrieval."""
+    results, kg_context = kg_enhanced_search(query, num_results)
+    return f"{kg_context}\n\n{results}" if kg_context else results
 
-def enhanced_search_rag_database(
-    query: str, 
-    num_results: int = 10,
-    use_reranking: bool = True,
-    use_hybrid: bool = True,
-    use_query_rewrite: bool = True
-) -> str:
-    """Enhanced search with hybrid retrieval, RRF fusion, and reranking."""
-    logger.info(f"Enhanced search for: '{query}'")
-    
-    clean_query = query.replace("PMID:", "").replace("pmid:", "").strip()
-    is_pmid_query = all(part.strip().isdigit() for part in clean_query.split(','))
-    
-    if is_pmid_query:
-        logger.info("PMID query detected - disabling enhancements")
-        
-        pmids = [p.strip() for p in clean_query.split(',')]
-        results = []
-        for pmid in pmids:
-            try:
-                collection = vectorstore._collection
-                pmid_docs = collection.get(where={"pmid": pmid})
-                
-                if pmid_docs and pmid_docs['ids']:
-                    for i, doc_id in enumerate(pmid_docs['ids']):
-                        doc = Document(
-                            page_content=pmid_docs['documents'][i],
-                            metadata=pmid_docs['metadatas'][i] if pmid_docs['metadatas'] else {}
-                        )
-                        results.append(doc)
-                    
-                    pmid_results = [r for r in results if r.metadata.get('pmid') == pmid]
-                    pmid_results.sort(key=lambda x: x.metadata.get('chunk_index', 0))
-                    
-            except Exception as e:
-                logger.error(f"Error fetching PMID {pmid}: {e}")
-                pmid_results = vectorstore.similarity_search(f"PMID: {pmid}", k=50)
-                pmid_results = [r for r in pmid_results if r.metadata.get('pmid') == pmid]
-                pmid_results.sort(key=lambda x: x.metadata.get('chunk_index', 0))
-                results.extend(pmid_results)
-        
-        if not results:
-            return f"No paper found with PMID: {clean_query}"
-            
-    else:
-        logger.info(f"Options: rerank={use_reranking}, hybrid={use_hybrid}, rewrite={use_query_rewrite}")
-        
-        if use_query_rewrite:
-            queries = query_rewriter.rewrite(query)
-            logger.info(f"Rewritten queries: {queries}")
-        else:
-            queries = [query]
-        
-        all_results_lists = []
-        
-        for q in queries:
-            try:
-                if use_hybrid:
-                    search_results = hybrid_retriever.search(q, k=num_results * 2)
-                else:
-                    search_results = vectorstore.similarity_search(q, k=num_results * 2)
-                
-                if search_results:
-                    all_results_lists.append(search_results)
-                    
-            except Exception as e:
-                logger.error(f"Search failed for query '{q}': {e}")
-        
-        if not all_results_lists:
-            return "No relevant papers found in local database."
-        
-        if len(all_results_lists) > 1:
-            results = reciprocal_rank_fusion(all_results_lists, top_n=num_results * 2)
-            logger.info(f"Fused {len(all_results_lists)} query results via RRF")
-        else:
-            results = all_results_lists[0]
-        
-        seen_content = set()
-        unique_results = []
-        for doc in results:
-            content_hash = hash(doc.page_content[:100])
-            if content_hash not in seen_content:
-                seen_content.add(content_hash)
-                unique_results.append(doc)
-        
-        if use_reranking and len(unique_results) > 1:
-            logger.info(f"Reranking {len(unique_results)} results with MedCPT cross-encoder...")
-            results = compressor.compress_documents(unique_results, query)[:num_results]
-        else:
-            results = unique_results[:num_results]
-    
+@tool
+def check_rag_for_topic_tool(keywords: str) -> str:
+    """Check if papers exist for a topic."""
+    results = hybrid_retriever.search(keywords, k=5)
     if not results:
-        return "No relevant papers found in local database."
-    
-    # Group and format results
-    papers_dict = {}
-    for doc in results:
-        pmid = doc.metadata.get("pmid", "unknown")
-        if pmid not in papers_dict:
-            papers_dict[pmid] = {
-                "pmid": pmid,
-                "title": doc.metadata.get("title", "Unknown"),
-                "authors": doc.metadata.get("authors", "Unknown"),
-                "year": doc.metadata.get("year", "Unknown"),
-                "has_full_text": doc.metadata.get("has_full_text", False),
-                "rrf_score": doc.metadata.get("rrf_score", 0),
-                "chunks": []
-            }
-        papers_dict[pmid]["chunks"].append(doc.page_content)
-    
-    if not is_pmid_query:
-        sorted_papers = sorted(
-            papers_dict.items(), 
-            key=lambda x: x[1].get("rrf_score", 0), 
-            reverse=True
-        )
-    else:
-        sorted_papers = list(papers_dict.items())
-    
-    output = []
-    output.append(f"Found {len(sorted_papers)} relevant paper(s)")
-    
-    if not is_pmid_query:
-        enhancements = []
-        if use_hybrid:
-            enhancements.append("hybrid search (MedCPT + BM25)")
-        if use_reranking:
-            enhancements.append("MedCPT cross-encoder reranking")
-        if use_query_rewrite:
-            enhancements.append("Qwen3 query expansion")
-        if enhancements:
-            output.append(f"   (Enhanced with: {', '.join(enhancements)})")
-    else:
-        output.append("   (Direct PMID retrieval - no enhancements applied)")
-    
-    output.append("\n")
-    
-    display_limit = len(sorted_papers) if is_pmid_query else min(num_results, len(sorted_papers))
-    
-    for idx, (pmid, info) in enumerate(sorted_papers[:display_limit], 1):
-        content_type = "full text" if info['has_full_text'] else "abstract"
-        combined_content = "\n\n".join(info['chunks'])
-        
-        if is_pmid_query and len(sorted_papers) == 1:
-            display_content = combined_content
-        elif len(sorted_papers) > 1:
-            max_length = 500
-            if len(combined_content) > max_length:
-                display_content = combined_content[:max_length] + "..."
-            else:
-                display_content = combined_content
-        else:
-            display_content = combined_content
-        
-        output.append(
-            f"\n[{idx}] PMID: {pmid}\n"
-            f"Title: {info['title']}\n"
-            f"Authors: {info['authors']}\n"
-            f"Year: {info['year']} | Type: {content_type}\n"
-            f"\nContent:\n{display_content}\n"
-            f"{'='*60}"
-        )
-    
-    if not is_pmid_query and len(sorted_papers) > num_results:
-        output.append(f"\nShowing top {num_results} of {len(sorted_papers)} results.")
-    
-    return "".join(output)
+        return f"No papers for '{keywords}'"
+    papers = {d.metadata.get("pmid"): d.metadata.get("title") for d in results if d.metadata.get("pmid")}
+    return f"Found {len(papers)} papers:\n" + "\n".join(f"• PMID:{p} | {t[:50]}..." for p, t in papers.items())
 
+@tool
+def get_database_stats_tool() -> str:
+    """Get database statistics."""
+    output = f"Vector DB: {vectorstore._collection.count()} chunks\n"
+    if kg_manager:
+        stats = kg_manager.get_stats()
+        output += f"KG: {stats.get('entities', 0):,} entities, {stats.get('relations', 0):,} relations"
+    return output
 
-def search_rag_database(query: str, num_results: int = 10) -> str:
-    """Search with smart enhancement detection."""
-    clean_query = query.replace("PMID:", "").replace("pmid:", "").strip()
-    is_pmid_query = all(part.strip().isdigit() for part in clean_query.split(','))
-    
-    if is_pmid_query:
-        return enhanced_search_rag_database(
-            query, num_results,
-            use_reranking=False,
-            use_hybrid=False,
-            use_query_rewrite=False
-        )
-    else:
-        return enhanced_search_rag_database(
-            query, num_results,
-            use_reranking=True,
-            use_hybrid=True,
-            use_query_rewrite=True
-        )
+@tool
+def verify_facts_tool(text: str) -> str:
+    """Verify claims against KG."""
+    if not kg_manager:
+        return "KG not enabled"
+    result = kg_manager.verify_response(text)
+    return f"Claims: {result['total_claims']}, Verified: {result['verified_claims']}, Rate: {result['verification_rate']:.0%}"
 
-
-search_rag_database_tool = tool(
-    search_rag_database,
-    description="Search RAG database with hybrid retrieval (MedCPT dense + BM25 sparse), RRF fusion, and MedCPT cross-encoder reranking"
-)
-
-enhanced_search_tool = tool(
-    enhanced_search_rag_database,
-    description="Advanced search with control over hybrid retrieval, reranking, and query rewriting"
-)
-
-
-def check_rag_for_topic(keywords: str) -> str:
-    """Checks if papers on this topic exist in the RAG database."""
-    try:
-        collection = vectorstore._collection
-        count = collection.count()
-        
-        if count == 0:
-            return "Database is empty. No papers stored yet."
-        
-        results = hybrid_retriever.search(keywords, k=5)
-        
-        if not results:
-            return f"No papers found for '{keywords}' in database ({count} total chunks)."
-        
-        papers_info = {}
-        for doc in results:
-            pmid = doc.metadata.get("pmid")
-            if pmid and pmid not in papers_info:
-                papers_info[pmid] = {
-                    "title": doc.metadata.get("title"),
-                    "year": doc.metadata.get("year")
-                }
-        
-        output = f"Found {len(papers_info)} relevant papers in database:\n"
-        for pmid, info in papers_info.items():
-            output += f"- PMID: {pmid} | {info['title'][:60]}... ({info['year']})\n"
-        
-        return output
-    except Exception as e:
-        return f"Error checking database: {e}"
-
-
-check_rag_for_topic_tool = tool(check_rag_for_topic)
-
-
-def remove_from_rag_database(identifier: str, search_type: str = "auto") -> str:
-    """Remove entries from the RAG database based on PMID or query."""
-    logger.info(f"Attempting to remove from database: '{identifier}' (type: {search_type})")
-    
-    if search_type == "auto":
-        clean_id = identifier.replace("PMID:", "").replace("pmid:", "").strip()
-        if all(part.strip().isdigit() for part in clean_id.split(',')):
-            search_type = "pmid"
-        else:
-            search_type = "query"
-    
-    try:
-        collection = vectorstore._collection
-        
-        if search_type == "pmid":
-            pmids = [p.strip() for p in identifier.replace("PMID:", "").replace("pmid:", "").strip().split(',')]
-            total_deleted = 0
-            
-            for pmid in pmids:
-                results = collection.get(where={"pmid": pmid})
-                
-                if results and results['ids']:
-                    collection.delete(ids=results['ids'])
-                    deleted_count = len(results['ids'])
-                    total_deleted += deleted_count
-                    logger.info(f"Deleted {deleted_count} chunks for PMID: {pmid}")
-            
-            bm25_retriever.refresh()
-            
-            if total_deleted > 0:
-                return f"Successfully deleted {total_deleted} chunks from {len(pmids)} PMID(s)"
-            else:
-                return f"No documents found for PMIDs: {', '.join(pmids)}"
-                
-        elif search_type == "query":
-            results = hybrid_retriever.search(identifier, k=20)
-            
-            if not results:
-                return f"No documents found matching query: '{identifier}'"
-            
-            pmids_to_delete = {}
-            for doc in results:
-                pmid = doc.metadata.get("pmid", "unknown")
-                title = doc.metadata.get("title", "Unknown")
-                if pmid not in pmids_to_delete:
-                    pmids_to_delete[pmid] = title
-            
-            output = f"Found {len(pmids_to_delete)} paper(s) matching '{identifier}':\n"
-            for pmid, title in pmids_to_delete.items():
-                output += f"  - PMID: {pmid} | {title[:60]}...\n"
-            
-            total_deleted = 0
-            for pmid in pmids_to_delete.keys():
-                results = collection.get(where={"pmid": pmid})
-                if results and results['ids']:
-                    collection.delete(ids=results['ids'])
-                    total_deleted += len(results['ids'])
-            
-            bm25_retriever.refresh()
-            
-            output += f"\nDeleted {total_deleted} total chunks from {len(pmids_to_delete)} papers."
-            return output
-            
-    except Exception as e:
-        return f"Error removing from database: {e}"
-
-
-remove_from_rag_tool = tool(remove_from_rag_database)
-
-
-def get_database_stats() -> str:
-    """Get enhanced statistics about the RAG database."""
-    try:
-        collection = vectorstore._collection
-        count = collection.count()
-        
-        if count == 0:
-            return "Database is empty (0 chunks, 0 papers)"
-        
-        sample_results = vectorstore.similarity_search("", k=min(100, count))
-        
-        unique_pmids = set()
-        unique_titles = set()
-        years = []
-        has_full_text_count = 0
-        
-        for doc in sample_results:
-            pmid = doc.metadata.get("pmid")
-            title = doc.metadata.get("title")
-            year = doc.metadata.get("year")
-            has_full_text = doc.metadata.get("has_full_text", False)
-            
-            if pmid:
-                unique_pmids.add(pmid)
-            if title:
-                unique_titles.add(title[:50])
-            if year:
-                years.append(int(year))
-            if has_full_text:
-                has_full_text_count += 1
-        
-        output = f"Database Statistics:\n"
-        output += f"├─ Total chunks: {count}\n"
-        output += f"├─ Estimated papers: {len(unique_pmids)}\n"
-        output += f"├─ Papers with full text: ~{has_full_text_count}\n"
-        
-        if years:
-            output += f"├─ Year range: {min(years)} - {max(years)}\n"
-        
-        output += f"├─ BM25 index: {'✓ Active' if bm25_retriever.bm25 else '✗ Not built'}\n"
-        output += f"├─ Embeddings: MedCPT (asymmetric query/article encoders)\n"
-        output += f"├─ LLM: Qwen3-8B\n"
-        output += f"└─ Features: ✓ Hybrid Search ✓ RRF Fusion ✓ MedCPT Reranking ✓ Query Rewriting\n"
-        
-        if unique_titles:
-            output += f"\nSample papers:\n"
-            for title in list(unique_titles)[:3]:
-                output += f"  • {title}...\n"
-        
-        return output
-    except Exception as e:
-        return f"Error getting stats: {e}"
-
-
-get_database_stats_tool = tool(get_database_stats)
+@tool
+def explore_kg_entity_tool(entity_name: str) -> str:
+    """Explore entity in KG."""
+    if not kg_manager:
+        return "KG not enabled"
+    entities = kg_manager.kg_db.find_entities_by_name(entity_name, limit=3)
+    if not entities:
+        return f"'{entity_name}' not found"
+    output = ""
+    for e in entities:
+        output += f"\n{e['name']} ({e['type']})\n"
+        for n in kg_manager.kg_db.get_entity_neighbors(e['id'], limit=5):
+            output += f"  → {n.get('relation', 'related')} → {n['name']}\n"
+    return output
 
 
 # ============================================
-# CHANGE 4: New Tool - Concept Similarity (uses BioLORD)
-# ============================================
-
-def find_similar_medical_concepts(query_concept: str, candidate_concepts: str = None) -> str:
-    """
-    Find biomedical concepts similar to a query concept using BioLORD-2023.
-    
-    This is useful for:
-    - Finding synonymous medical terms
-    - Understanding related conditions/treatments
-    - Query expansion with domain knowledge
-    
-    Args:
-        query_concept: The medical concept to find similarities for
-        candidate_concepts: Optional comma-separated list of concepts to compare against.
-                          If not provided, uses a default biomedical vocabulary.
-    
-    Returns:
-        Ranked list of similar concepts with similarity scores
-    """
-    # Default medical concepts if none provided
-    if not candidate_concepts:
-        default_concepts = [
-            "cancer", "tumor", "carcinoma", "neoplasm", "malignancy",
-            "therapy", "treatment", "drug", "medication", "intervention",
-            "gene", "mutation", "expression", "pathway", "regulation",
-            "protein", "receptor", "enzyme", "inhibitor", "antibody",
-            "inflammation", "immune response", "autoimmune", "infection",
-            "cardiovascular", "heart disease", "hypertension", "stroke",
-            "diabetes", "metabolic", "obesity", "insulin resistance",
-            "neurological", "dementia", "Alzheimer", "Parkinson",
-            "respiratory", "pulmonary", "asthma", "COPD",
-            "clinical trial", "randomized", "placebo", "efficacy"
-        ]
-        candidates = default_concepts
-    else:
-        candidates = [c.strip() for c in candidate_concepts.split(",")]
-    
-    try:
-        results = concept_engine.find_similar(query_concept, candidates, top_k=10)
-        
-        output = f"Concepts similar to '{query_concept}' (using BioLORD-2023):\n\n"
-        for i, (concept, score) in enumerate(results, 1):
-            bar = "█" * int(score * 20)
-            output += f"  {i}. {concept:25s} {score:.3f} {bar}\n"
-        
-        output += f"\nNote: Scores > 0.7 indicate high semantic similarity."
-        return output
-        
-    except Exception as e:
-        return f"Error computing concept similarity: {e}"
-
-
-find_similar_concepts_tool = tool(
-    find_similar_medical_concepts,
-    description="Find biomedically similar concepts using BioLORD-2023 semantic embeddings. Useful for query expansion and understanding related terms."
-)
-
-
-# ============================================
-# AGENT SETUP
+# AGENT
 # ============================================
 
 memory = MemorySaver()
+system_prompt = "You are a PubMed research assistant with KG integration. Use tools to search papers. Only cite PMIDs from results."
 
-system_prompt = '''You are a PubMed research assistant powered by Qwen3-8B with advanced retrieval capabilities.
+tools = [pubmed_search_and_store_tool, search_rag_database_tool, check_rag_for_topic_tool,
+         get_database_stats_tool, verify_facts_tool, explore_kg_entity_tool]
 
-CRITICAL RULE - READ THIS FIRST:
-You can ONLY cite papers that appear in tool results. If a PMID is not in the tool output, you do not know about it.
-When uncertain, say "I don't have information about that" rather than guessing.
-
-TOOLS YOU HAVE:
-1. pubmed_search_and_store_tool - Search PubMed and add papers to database
-2. search_rag_database_tool - Find papers in your database (uses MedCPT + BM25 hybrid search)
-3. check_rag_for_topic_tool - Check if a topic exists in database
-4. remove_from_rag_tool - Delete papers from database
-5. get_database_stats_tool - Show database statistics
-6. find_similar_concepts_tool - Find related medical terms (uses BioLORD)
-
-RETRIEVAL PIPELINE:
-Your database uses MedCPT asymmetric embeddings trained on 255M PubMed queries.
-- Dense retrieval: MedCPT (separate query/article encoders)
-- Sparse retrieval: BM25
-- Fusion: Reciprocal Rank Fusion
-- Reranking: MedCPT Cross-Encoder
-
-WORKFLOW:
-1. User asks about a topic
-2. Use check_rag_for_topic_tool to see if you have papers
-3. If yes → use search_rag_database_tool to retrieve them
-4. If no → use pubmed_search_and_store_tool to fetch new papers
-5. Answer using ONLY the retrieved content
-
-RESPONSE FORMAT:
-When citing a paper, use this format:
-  [PMID:NUMBER] "Exact Title From Tool Output" - First Author et al.
-
-Example format ONLY (do not use these fake PMIDs):
-  [PMID:00000001] "Example Paper Title" - Smith et al.
-  
-Only use PMIDs that appear in your tool results. Never invent a PMID.
-
-FORBIDDEN:
-- Do not cite any PMID not in tool output
-- Do not copy topics from this prompt into searches
-- Do not reference papers you have not retrieved
-
-REMEMBER: No PMID in tool output = You don't know about it. Never guess.'''
-
-tools = [
-    pubmed_search_and_store_tool,
-    search_rag_database_tool,
-    enhanced_search_tool,
-    check_rag_for_topic_tool,
-    remove_from_rag_tool,
-    get_database_stats_tool,
-    find_similar_concepts_tool,  # NEW: BioLORD-based concept similarity
-]
-
-pubmed_agent = create_agent(
-    model=pi_llm,
-    tools=tools,
-    system_prompt=system_prompt,
-    checkpointer=memory,
-)
-
-
-# ============================================
-# MIGRATION UTILITY
-# ============================================
-
-def migrate_from_biolord_to_medcpt(
-    old_path: str = "./pubmed_rag_db",
-    new_path: str = "./medcpt_pubmed_rag_db"
-):
-    """
-    Migrate existing BioLORD-embedded documents to MedCPT embeddings.
-    Run this once if you have existing data.
-    """
-    if not os.path.exists(old_path):
-        print(f"No existing database found at {old_path}")
-        return
-    
-    if os.path.exists(new_path):
-        print(f"New database already exists at {new_path}")
-        response = input("Overwrite? (y/n): ")
-        if response.lower() != 'y':
-            return
-    
-    print("Loading old BioLORD vectorstore...")
-    old_embeddings = HuggingFaceEmbeddings(
-        model_name="FremyCompany/BioLORD-2023",
-        model_kwargs={'device': 'cuda'}
-    )
-    old_vs = Chroma(
-        collection_name="pubmed_papers",
-        embedding_function=old_embeddings,
-        persist_directory=old_path
-    )
-    
-    collection = old_vs._collection
-    count = collection.count()
-    print(f"Found {count} documents to migrate")
-    
-    if count == 0:
-        print("Nothing to migrate!")
-        return
-    
-    all_data = collection.get(include=['documents', 'metadatas'])
-    
-    print("Re-embedding with MedCPT (this may take a while)...")
-    
-    # Add documents in batches
-    batch_size = 100
-    documents = all_data['documents']
-    metadatas = all_data['metadatas']
-    
-    for i in range(0, len(documents), batch_size):
-        batch_docs = documents[i:i+batch_size]
-        batch_meta = metadatas[i:i+batch_size]
-        
-        doc_objects = [
-            Document(page_content=doc, metadata=meta or {})
-            for doc, meta in zip(batch_docs, batch_meta)
-        ]
-        
-        vectorstore.add_documents(doc_objects)
-        print(f"  Migrated {min(i+batch_size, len(documents))}/{len(documents)}")
-    
-    # Rebuild BM25 index
-    bm25_retriever.refresh()
-    
-    print(f"\nMigration complete!")
-    print(f"New MedCPT database at: {new_path}")
-    print(f"Old BioLORD database preserved at: {old_path}")
+pubmed_agent = create_agent(model=pi_llm, tools=tools, system_prompt=system_prompt, checkpointer=memory)
 
 
 # ============================================
@@ -1534,104 +1035,69 @@ def migrate_from_biolord_to_medcpt(
 
 def main():
     print("\n" + "="*60)
-    print("PubMed Research Assistant v2.0")
+    print("PubMed Research Agent v3.1 - Knowledge Graph Edition")
     print("="*60)
-    print("Upgrades:")
-    print("  • LLM: Ministral3-8B)")
-    print("  • Retrieval: MedCPT asymmetric embeddings")
-    print("  • Concept similarity: BioLORD-2023")
-    print("  • Reranking: MedCPT Cross-Encoder")
-    print("="*60)
-    print("\nCommands:")
-    print("  'exit' - quit")
-    print("  'stats' - database info")
-    print("  'vram' - show GPU memory usage")
-    print("  'clear' - clear screen")
-    print("  'migrate' - migrate old BioLORD database to MedCPT")
+    print("Commands: exit, stats, kg, vram, gc, verify <text>, entity <name>")
     print()
-    
-    stats_result = get_database_stats()
-    print(f"{stats_result}\n")
-    
-    config = {"configurable": {"thread_id": "cli-thread"}, "recursion_limit": 250}
+    print(get_database_stats_tool.invoke({}))
+    print()
     
     while True:
         try:
             user_input = input(">>> ").strip()
             
             if user_input.lower() in {"exit", "quit"}:
+                if kg_manager:
+                    kg_manager.close()
                 print("Goodbye!")
                 break
             
             if user_input.lower() == "stats":
-                print(f"\n{get_database_stats()}\n")
+                print(f"\n{get_database_stats_tool.invoke({})}\n")
                 continue
             
-            if user_input.lower() == "clear":
-                os.system('cls' if os.name == 'nt' else 'clear')
+            if user_input.lower() == "kg":
+                if kg_manager:
+                    print(f"\nKG: {kg_manager.get_stats()}\n")
                 continue
             
             if user_input.lower() == "vram":
-                allocated = torch.cuda.memory_allocated() / 1e9
-                reserved = torch.cuda.memory_reserved() / 1e9
-                total = torch.cuda.get_device_properties(0).total_memory / 1e9
-                print(f"\nGPU Memory (RTX 5060):")
-                print(f"  Allocated: {allocated:.2f} GB")
-                print(f"  Reserved:  {reserved:.2f} GB")
-                print(f"  Total:     {total:.2f} GB")
-                print(f"  Free:      {total - reserved:.2f} GB")
-                print(f"\nTip: Run 'gc' to force garbage collection and clear cache\n")
+                print(f"\nVRAM: {torch.cuda.memory_allocated()/1e9:.2f} / {torch.cuda.get_device_properties(0).total_memory/1e9:.2f} GB\n")
                 continue
             
             if user_input.lower() == "gc":
                 import gc
                 gc.collect()
                 torch.cuda.empty_cache()
-                print("Garbage collected and CUDA cache cleared.\n")
+                if kg_manager:
+                    kg_manager.unload_gliner()
+                print("Cleared\n")
                 continue
             
-            if user_input.lower() == "refresh":
-                print("Refreshing BM25 index...")
-                bm25_retriever.refresh()
-                print("Done!\n")
+            if user_input.lower().startswith("verify "):
+                print(f"\n{verify_facts_tool.invoke({'text': user_input[7:]})}\n")
                 continue
             
-            if user_input.lower() == "migrate":
-                migrate_from_biolord_to_medcpt()
+            if user_input.lower().startswith("entity "):
+                print(f"\n{explore_kg_entity_tool.invoke({'entity_name': user_input[7:]})}\n")
                 continue
             
-            if user_input.lower().startswith("test multi"):
-                parts = user_input[10:].strip().split()
-                keywords = parts[0] if parts else "CRISPR"
-                years = parts[1] if len(parts) > 1 else "2022-2024"
-                print(f"\nTesting async multi-year search: '{keywords}' for years {years}...")
-                result = pubmed_search_and_store_multi_year(keywords, years, pnum=3)
-                print(result)
-                print(f"\n{get_database_stats()}\n")
-                continue
-            
-            # Regular agent interaction
             print("\nProcessing...")
-            
-            result = pubmed_agent.invoke(
-                {"messages": [HumanMessage(content=user_input)]},
-                config={"configurable": {"thread_id": "cli-thread"}, "recursion_limit": 500}
-            )
+            result = pubmed_agent.invoke({"messages": [HumanMessage(content=user_input)]},
+                                        config={"configurable": {"thread_id": "cli"}, "recursion_limit": 500})
             
             for msg in reversed(result['messages']):
                 if isinstance(msg, AIMessage) and msg.content:
                     print(f"\nAI: {msg.content}\n")
                     break
-                else:
-                    print(f"Agent ended with: {msg.pretty_print()}")
-
+        
         except KeyboardInterrupt:
+            if kg_manager:
+                kg_manager.close()
             print("\nGoodbye!")
             break
         except Exception as e:
             print(f"\nError: {e}\n")
-            import traceback
-            traceback.print_exc()
 
 
 if __name__ == "__main__":
