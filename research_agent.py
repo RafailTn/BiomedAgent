@@ -81,7 +81,7 @@ logger.info(f"Script directory: {SCRIPT_DIR}")
 # LLM
 # ============================================
 
-pi_llm = ChatOllama(model="ministral-3:8b")
+pi_llm = ChatOllama(model="qwen3:8b")
 
 
 # ============================================
