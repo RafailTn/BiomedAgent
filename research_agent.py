@@ -84,7 +84,7 @@ logger.info(f"Kuzu DB path: {KUZU_DB_PATH}")
 # LLM
 # ============================================
 
-pi_llm = ChatOllama(model="ministral-3:3b")
+pi_llm = ChatOllama(model="ministral-3:8b")
 
 
 # ============================================
