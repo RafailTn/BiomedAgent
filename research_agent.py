@@ -1396,7 +1396,7 @@ find_similar_concepts_tool = tool(
 
 memory = MemorySaver()
 
-system_prompt = '''You are a PubMed research assistant powered by Qwen3-8B with advanced retrieval capabilities.
+system_prompt = '''You are a PubMed research assistant powered by Ministral3-8B with advanced retrieval capabilities.
 
 CRITICAL RULE - READ THIS FIRST:
 You can ONLY cite papers that appear in tool results. If a PMID is not in the tool output, you do not know about it.
