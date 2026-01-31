@@ -1,5 +1,5 @@
 """
-PubMed Research Agent v3.1
+PubMed Research Agent v3.2
 ==========================
 Main agent script that imports KG functionality from knowledge_graph.py
 
@@ -8,6 +8,7 @@ Features:
 - BM25 + Dense hybrid search with RRF fusion
 - Knowledge graph integration for hallucination reduction
 - Async PubMed fetching with full-text support
+- **Integrated Fast PrimeKG Loading**
 """
 
 import os
@@ -302,7 +303,7 @@ class AsyncPubMedFetcher:
 # ============================================
 
 logger.info("="*60)
-logger.info("PubMed Research Agent v3.1")
+logger.info("PubMed Research Agent v3.2")
 logger.info("="*60)
 
 # MedCPT embeddings
@@ -338,11 +339,41 @@ async_fetcher = AsyncPubMedFetcher(email=Entrez.email, api_key=os.getenv("NCBI_A
 kg_manager: Optional[KnowledgeGraphManager] = None
 
 if ENABLE_KNOWLEDGE_GRAPH:
+    # ----------------------------------------------------
+    # FIX: INTEGRATE FAST LOADER AUTOMATICALLY
+    # ----------------------------------------------------
+    # If we want to load PrimeKG, but the DB is empty or missing:
+    if LOAD_PRIMEKG and not (KUZU_DB_PATH.exists() and any(KUZU_DB_PATH.iterdir())):
+        logger.info("!!! Database missing. Automatically triggering FAST loader... !!!")
+        try:
+            # Dynamically import the fast loader script
+            import load_primekg
+            
+            logger.info("--- Step 1: Checking Data ---")
+            edges_file = load_primekg.download_primekg()
+            
+            logger.info("--- Step 2: Preparing Polars CSVs ---")
+            entities_csv, relations_csv = load_primekg.prepare_csvs_for_kuzu(edges_file, PRIMEKG_LIMIT)
+            
+            logger.info("--- Step 3: Bulk Loading (COPY FROM) ---")
+            load_primekg.bulk_load_into_kuzu(entities_csv, relations_csv)
+            
+            logger.info("✓ Fast load complete!")
+            
+        except ImportError:
+            logger.error("Could not import 'load_primekg.py'. Ensure it is in the same folder.")
+        except Exception as e:
+            logger.error(f"Fast load failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # Now initialize KG Manager, but tell it NOT to try loading PrimeKG 
+    # (since we either just did it fast, or it's already there)
     try:
         kg_manager = KnowledgeGraphManager(
             db_path=KUZU_DB_PATH,
             gliner_device=GLINER_DEVICE,
-            load_primekg=LOAD_PRIMEKG,
+            load_primekg=False,  # <--- FALSE because we handled it above!
             primekg_limit=PRIMEKG_LIMIT,
             primekg_data_dir=PRIMEKG_DATA_DIR
         )
@@ -589,7 +620,7 @@ pubmed_agent = create_agent(
 
 def main():
     print("\n" + "="*60)
-    print("PubMed Research Agent v3.1 - Knowledge Graph Edition")
+    print("PubMed Research Agent v3.2 - Knowledge Graph Edition")
     print("="*60)
     print("Commands: exit, stats, kg, vram, gc, verify <text>, entity <n>")
     print()
@@ -662,3 +693,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

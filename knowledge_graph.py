@@ -86,7 +86,7 @@ class GLiNERExtractor:
     
     DEFAULT_LABELS = ["Disease", "Drug", "Gene", "Protein", "Chemical", "Cell Type", "Organism", "Pathway"]
     
-    def __init__(self, model_name: str = "urchade/gliner_medium_bio-v1.0",
+    def __init__(self, model_name: str = "Ihor/gliner-biomed-bi-small-v1.0",
                  device: str = "cpu", threshold: float = 0.4):
         self.device = device
         self.threshold = threshold
