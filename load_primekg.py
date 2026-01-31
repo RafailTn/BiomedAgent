@@ -153,14 +153,15 @@ def prepare_csvs_for_kuzu(edges_file: Path, limit: int = None):
     
     return entities_csv, relations_csv
 
-
 def bulk_load_into_kuzu(entities_csv: Path, relations_csv: Path, force: bool = False):
     """
-    Load CSVs into Kuzu using COPY FROM with delimiter specification.
+    Load CSVs into Kuzu using COPY FROM.
+    Refined to handle 'Zombie Files' (where DB exists as a file instead of a folder).
     """
-    # Check existing database
+    # 1. CHECK EXISTING DB
     if KUZU_DB_PATH.exists() and not force:
         try:
+            # Try to connect regardless of whether it is a file or folder
             db = kuzu.Database(str(KUZU_DB_PATH))
             conn = kuzu.Connection(db)
             result = conn.execute("MATCH (e:Entity) RETURN count(e)")
@@ -173,15 +174,25 @@ def bulk_load_into_kuzu(entities_csv: Path, relations_csv: Path, force: bool = F
                 logger.info("Use --force to reload")
                 return entity_count, rel_count
         except Exception as e:
-            logger.warning(f"Could not read existing DB: {e}")
-    
-    # Remove existing for clean COPY
+            logger.warning(f"Existing DB check failed (will reload): {e}")
+
+    # 2. CLEANUP: Delete existing DB whether it is a file OR a folder
     if KUZU_DB_PATH.exists():
         logger.info("Removing existing database...")
-        shutil.rmtree(KUZU_DB_PATH)
+        try:
+            if KUZU_DB_PATH.is_dir():
+                shutil.rmtree(KUZU_DB_PATH)
+            else:
+                # This fixes the "NotADirectoryError" if it was created as a file
+                KUZU_DB_PATH.unlink()
+        except Exception as e:
+            logger.warning(f"Cleanup warning: {e}")
     
-    # Create fresh database
+    # 3. CREATE NEW DATABASE
     logger.info(f"Creating Kuzu database: {KUZU_DB_PATH}")
+    
+    # We let Kuzu handle the creation logic (file vs folder) automatically
+    # by passing the path string directly.
     db = kuzu.Database(str(KUZU_DB_PATH))
     conn = kuzu.Connection(db)
     
@@ -210,6 +221,7 @@ def bulk_load_into_kuzu(entities_csv: Path, relations_csv: Path, force: bool = F
     
     try:
         abs_path = str(entities_csv.resolve())
+        # Note: Using pipe delimiter '|' to handle chemical names with commas
         conn.execute(f"COPY Entity FROM '{abs_path}' (header=true, delimiter='|')")
         
         result = conn.execute("MATCH (e:Entity) RETURN count(e)")
@@ -237,7 +249,6 @@ def bulk_load_into_kuzu(entities_csv: Path, relations_csv: Path, force: bool = F
         raise
     
     return entity_count, rel_count
-
 
 def main():
     parser = argparse.ArgumentParser(description='Fast PrimeKG loader using Polars and Kuzu')

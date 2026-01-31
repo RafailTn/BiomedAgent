@@ -82,7 +82,7 @@ logger.info(f"Script directory: {SCRIPT_DIR}")
 # LLM
 # ============================================
 
-pi_llm = ChatOllama(model="qwen3:8b")
+pi_llm = ChatOllama(model="ministral-3:8b")
 
 
 # ============================================
@@ -340,11 +340,29 @@ kg_manager: Optional[KnowledgeGraphManager] = None
 
 if ENABLE_KNOWLEDGE_GRAPH:
     # ----------------------------------------------------
-    # FIX: INTEGRATE FAST LOADER AUTOMATICALLY
+    # FIX: ROBUST DATABASE CHECK
     # ----------------------------------------------------
-    # If we want to load PrimeKG, but the DB is empty or missing:
-    if LOAD_PRIMEKG and not (KUZU_DB_PATH.exists() and any(KUZU_DB_PATH.iterdir())):
-        logger.info("!!! Database missing. Automatically triggering FAST loader... !!!")
+    # We check if the DB path exists. We removed .iterdir() so it won't crash 
+    # if the OS sees the database as a file instead of a folder.
+    
+    db_missing = not KUZU_DB_PATH.exists()
+    
+    # If it exists, we check if it's suspiciously small (e.g. < 1KB), which implies it's empty/corrupt
+    is_empty = False
+    if KUZU_DB_PATH.exists():
+        try:
+            # Check size depending on if it's a file or folder
+            if KUZU_DB_PATH.is_file():
+                is_empty = KUZU_DB_PATH.stat().st_size < 1024
+            elif KUZU_DB_PATH.is_dir():
+                # If it's a folder, check if it has content
+                is_empty = not any(KUZU_DB_PATH.iterdir())
+        except Exception:
+            # If we can't check, assume it might need reloading
+            pass
+
+    if LOAD_PRIMEKG and (db_missing or is_empty):
+        logger.info("!!! Database missing or empty. Automatically triggering FAST loader... !!!")
         try:
             # Dynamically import the fast loader script
             import load_primekg
@@ -367,13 +385,12 @@ if ENABLE_KNOWLEDGE_GRAPH:
             import traceback
             traceback.print_exc()
 
-    # Now initialize KG Manager, but tell it NOT to try loading PrimeKG 
-    # (since we either just did it fast, or it's already there)
     try:
         kg_manager = KnowledgeGraphManager(
             db_path=KUZU_DB_PATH,
             gliner_device=GLINER_DEVICE,
-            load_primekg=False,  # <--- FALSE because we handled it above!
+            # We set load_primekg=False here because we handled the loading above (if needed)
+            load_primekg=False,  
             primekg_limit=PRIMEKG_LIMIT,
             primekg_data_dir=PRIMEKG_DATA_DIR
         )
