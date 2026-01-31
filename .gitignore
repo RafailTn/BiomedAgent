@@ -4,6 +4,7 @@
 .env.development.local
 .env.test.local
 .env.production.local
+kuzu_biomedical_kg
 
 # Python
 __pycache__/
@@ -40,5 +41,6 @@ Thumbs.db
 
 # Other
 medcpt_pubmed_rag_db/
+primekg_data/
 geo_rag_db/
 test/

@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-PrimeKG FAST Loader
-===================
-Uses Kuzu COPY FROM for bulk loading - loads 4M relations in ~1-2 minutes!
+PrimeKG FAST Loader (Polars Edition)
+====================================
+Uses Polars for fast CSV processing and Kuzu COPY FROM for bulk loading.
 
 Speed comparison:
-- Row-by-row: 10-15 minutes (or hours)
-- COPY FROM:  1-2 minutes
+- Pandas + Row-by-row: 10-15 minutes
+- Polars + COPY FROM:  < 1 minute
 
 Usage:
-    python load_primekg_fast.py                  # Full load (~2 min)
-    python load_primekg_fast.py --limit 100000   # Quick test (~20 sec)
-    python load_primekg_fast.py --force          # Force reload
+    python load_primekg.py                  # Full load
+    python load_primekg.py --limit 100000   # Quick test
+    python load_primekg.py --force          # Force reload
 """
 
 import sys
@@ -20,6 +20,14 @@ import argparse
 import shutil
 import logging
 from pathlib import Path
+
+# Try importing polars
+try:
+    import polars as pl
+except ImportError:
+    sys.exit("Error: Polars is missing. Install it with: pip install polars")
+
+import kuzu
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -60,19 +68,26 @@ def download_primekg():
 
 def prepare_csvs_for_kuzu(edges_file: Path, limit: int = None):
     """
-    Prepare CSVs in Kuzu's exact format for COPY FROM.
-    
-    Key requirements:
-    - Entity CSV: columns must match table schema order
-    - Relation CSV: first two columns must be FROM and TO node IDs
+    Prepare CSVs using Polars.
+    Uses pipe '|' separator to avoid collision with commas in chemical names.
     """
-    import pandas as pd
-    
     entities_csv = PRIMEKG_DATA_DIR / "kuzu_entities.csv"
     relations_csv = PRIMEKG_DATA_DIR / "kuzu_relations.csv"
     
-    logger.info("Reading PrimeKG data...")
-    df = pd.read_csv(edges_file, low_memory=False)
+    logger.info("Reading PrimeKG data with Polars...")
+    
+    # === FIX: FORCE IDs TO BE STRINGS ===
+    # We use schema_overrides to prevent Polars from guessing 'x_id' is an integer
+    df = pl.read_csv(
+        edges_file, 
+        infer_schema_length=10000,
+        schema_overrides={
+            "x_id": pl.Utf8, 
+            "y_id": pl.Utf8,
+            "x_type": pl.Utf8,
+            "y_type": pl.Utf8
+        }
+    )
     
     if limit:
         df = df.head(limit)
@@ -83,45 +98,57 @@ def prepare_csvs_for_kuzu(edges_file: Path, limit: int = None):
     
     # === Extract unique entities ===
     logger.info("Extracting unique entities...")
-    subjects = df[['x_id', 'x_type', 'x_name']].drop_duplicates()
-    objects = df[['y_id', 'y_type', 'y_name']].drop_duplicates()
     
-    # Rename and combine
-    subjects.columns = ['orig_id', 'type', 'name']
-    objects.columns = ['orig_id', 'type', 'name']
-    all_entities = pd.concat([subjects, objects]).drop_duplicates(subset=['orig_id'])
+    # Select x and y columns, rename them to standard names
+    subjects = df.select([
+        pl.col('x_id').alias('orig_id'),
+        pl.col('x_type').alias('type'),
+        pl.col('x_name').alias('name')
+    ])
+    
+    objects = df.select([
+        pl.col('y_id').alias('orig_id'),
+        pl.col('y_type').alias('type'),
+        pl.col('y_name').alias('name')
+    ])
+    
+    # Concat and get unique entities by ID
+    all_entities = pl.concat([subjects, objects]).unique(subset=['orig_id'])
     
     logger.info(f"Found {len(all_entities):,} unique entities")
     
     # === Create Entity CSV ===
-    # Schema: id STRING, name STRING, type STRING, cui STRING, source STRING, description STRING
     logger.info("Creating entities CSV for Kuzu...")
     
-    entity_df = pd.DataFrame({
-        'id': 'primekg:' + all_entities['orig_id'].astype(str),
-        'name': all_entities['name'].fillna('').astype(str),
-        'type': all_entities['type'].fillna('').astype(str),
-        'cui': '',
-        'source': 'primekg',
-        'description': ''
-    })
-    entity_df.to_csv(entities_csv, index=False)
+    # Transform to Kuzu schema using Polars expressions
+    # Note: we don't need .cast(pl.Utf8) for IDs anymore since we forced it at read time
+    entity_df = all_entities.select([
+        (pl.lit('primekg:') + pl.col('orig_id')).alias('id'),
+        pl.col('name').fill_null("").cast(pl.Utf8).alias('name'),
+        pl.col('type').fill_null("").cast(pl.Utf8).alias('type'),
+        pl.lit("").alias('cui'),
+        pl.lit("primekg").alias('source'),
+        pl.lit("").alias('description')
+    ])
+    
+    # Write with PIPE separator
+    entity_df.write_csv(entities_csv, separator='|')
     logger.info(f"  Saved: {entities_csv} ({len(entity_df):,} rows)")
     
     # === Create Relations CSV ===
-    # For REL TABLE COPY: FROM_id, TO_id, prop1, prop2, ...
-    # Schema: relation STRING, source STRING, confidence DOUBLE, pmid STRING
     logger.info("Creating relations CSV for Kuzu...")
     
-    rel_df = pd.DataFrame({
-        'from': 'primekg:' + df['x_id'].astype(str),
-        'to': 'primekg:' + df['y_id'].astype(str),
-        'relation': df['relation'].fillna('').astype(str),
-        'source': 'primekg',
-        'confidence': 1.0,
-        'pmid': ''
-    })
-    rel_df.to_csv(relations_csv, index=False)
+    rel_df = df.select([
+        (pl.lit('primekg:') + pl.col('x_id')).alias('from'),
+        (pl.lit('primekg:') + pl.col('y_id')).alias('to'),
+        pl.col('relation').fill_null("").cast(pl.Utf8).alias('relation'),
+        pl.lit("primekg").alias('source'),
+        pl.lit(1.0).alias('confidence'),
+        pl.lit("").alias('pmid')
+    ])
+    
+    # Write with PIPE separator
+    rel_df.write_csv(relations_csv, separator='|')
     logger.info(f"  Saved: {relations_csv} ({len(rel_df):,} rows)")
     
     return entities_csv, relations_csv
@@ -129,10 +156,8 @@ def prepare_csvs_for_kuzu(edges_file: Path, limit: int = None):
 
 def bulk_load_into_kuzu(entities_csv: Path, relations_csv: Path, force: bool = False):
     """
-    Load CSVs into Kuzu using COPY FROM (very fast!).
+    Load CSVs into Kuzu using COPY FROM with delimiter specification.
     """
-    import kuzu
-    
     # Check existing database
     if KUZU_DB_PATH.exists() and not force:
         try:
@@ -184,9 +209,8 @@ def bulk_load_into_kuzu(entities_csv: Path, relations_csv: Path, force: bool = F
     start = time.time()
     
     try:
-        # Use absolute path for COPY command
         abs_path = str(entities_csv.resolve())
-        conn.execute(f"COPY Entity FROM '{abs_path}' (header=true)")
+        conn.execute(f"COPY Entity FROM '{abs_path}' (header=true, delimiter='|')")
         
         result = conn.execute("MATCH (e:Entity) RETURN count(e)")
         entity_count = result.get_next()[0]
@@ -202,7 +226,7 @@ def bulk_load_into_kuzu(entities_csv: Path, relations_csv: Path, force: bool = F
     
     try:
         abs_path = str(relations_csv.resolve())
-        conn.execute(f"COPY RELATES_TO FROM '{abs_path}' (header=true)")
+        conn.execute(f"COPY RELATES_TO FROM '{abs_path}' (header=true, delimiter='|')")
         
         result = conn.execute("MATCH ()-[r:RELATES_TO]->() RETURN count(r)")
         rel_count = result.get_next()[0]
@@ -216,18 +240,15 @@ def bulk_load_into_kuzu(entities_csv: Path, relations_csv: Path, force: bool = F
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Fast PrimeKG loader using Kuzu COPY FROM')
+    parser = argparse.ArgumentParser(description='Fast PrimeKG loader using Polars and Kuzu')
     parser.add_argument('--limit', type=int, help='Limit edges (e.g., 100000 for testing)')
     parser.add_argument('--force', action='store_true', help='Force reload even if exists')
     args = parser.parse_args()
     
     print("\n" + "="*60)
-    print("PrimeKG FAST Loader (Kuzu COPY FROM)")
+    print("PrimeKG FAST Loader (Polars Edition)")
     print("="*60)
     print(f"Database: {KUZU_DB_PATH}")
-    if args.limit:
-        print(f"Limit: {args.limit:,} edges")
-    print("="*60 + "\n")
     
     total_start = time.time()
     
@@ -248,7 +269,6 @@ def main():
         print(f"  Entities:  {entity_count:,}")
         print(f"  Relations: {rel_count:,}")
         print("="*60)
-        print("\nThe research agent will detect this database automatically.")
         
     except Exception as e:
         logger.error(f"Failed: {e}")
