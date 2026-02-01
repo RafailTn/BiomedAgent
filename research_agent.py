@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-Entrez.email = "rafailadam46@gmail.com"
+Entrez.email = ""
 pi_llm = ChatOllama(model="ministral-3:8b")
 # worker_llm = ChatOllama(model='cniongolo/biomistral')
 embeddings = HuggingFaceEmbeddings(
