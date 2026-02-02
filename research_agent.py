@@ -42,12 +42,14 @@ from collections import defaultdict
 from rank_bm25 import BM25Okapi
 from pathlib import Path
 import logging
-
+import requests
 # Import knowledge graph module
 from knowledge_graph import KnowledgeGraphManager
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+# Constants
+REQUEST_TIMEOUT = 15
 
 load_dotenv()
 
@@ -592,6 +594,804 @@ def explore_kg_entity_tool(entity_name: str) -> str:
             output += f"  → {n.get('relation', 'related')} → {n['name']}\n"
     return output
 
+# =========================================
+# GENE INFO TOOL
+# =========================================
+
+@tool
+def gene_info_tool(gene_symbol: str) -> str:
+    """
+    Get authoritative information about a gene from NCBI and UniProt.
+    
+    ALWAYS use this tool FIRST before answering questions about a gene's
+    function, expression, or role in disease. This prevents hallucination.
+    
+    Args:
+        gene_symbol: Gene symbol (e.g., "EGFR", "TP53", "EGFLAM")
+    
+    Returns:
+        Official gene name, aliases, function summary, and associated diseases
+    """
+    # Normalize gene symbol
+    gene_symbol = gene_symbol.strip().upper()
+    
+    output = [f"**Gene Information: {gene_symbol}**\n"]
+    sources_status = {"NCBI Gene": "❌ NOT QUERIED", "UniProt": "❌ NOT QUERIED"}
+    found_info = False
+    
+    # =========================================
+    # 1. NCBI Gene Database
+    # =========================================
+    try:
+        search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+        search_params = {
+            "db": "gene",
+            "term": f"{gene_symbol}[Gene Name] AND Homo sapiens[Organism]",
+            "retmode": "json",
+            "retmax": 1
+        }
+        
+        r = requests.get(search_url, params=search_params, timeout=REQUEST_TIMEOUT)
+        
+        if r.ok:
+            search_data = r.json()
+            id_list = search_data.get("esearchresult", {}).get("idlist", [])
+            
+            if id_list:
+                gene_id = id_list[0]
+                
+                fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+                fetch_params = {"db": "gene", "id": gene_id, "retmode": "json"}
+                
+                r2 = requests.get(fetch_url, params=fetch_params, timeout=REQUEST_TIMEOUT)
+                
+                if r2.ok:
+                    data = r2.json()
+                    gene_data = data.get("result", {}).get(gene_id, {})
+                    
+                    if gene_data:
+                        found_info = True
+                        sources_status["NCBI Gene"] = "✅ SUCCESS"
+                        
+                        output.append(f"**Official Symbol:** {gene_data.get('name', gene_symbol)}")
+                        output.append(f"**Full Name:** {gene_data.get('description', 'Unknown')}")
+                        
+                        aliases = gene_data.get("otheraliases", "")
+                        if aliases:
+                            output.append(f"**Aliases:** {aliases}")
+                        
+                        summary = gene_data.get("summary", "")
+                        if summary:
+                            if len(summary) > 500:
+                                summary = summary[:500] + "..."
+                            output.append(f"\n**Function:**\n{summary}")
+                        
+                        chrom = gene_data.get("chromosome", "")
+                        if chrom:
+                            output.append(f"\n**Location:** Chromosome {chrom}")
+                        
+                        output.append(f"**NCBI Gene ID:** {gene_id}")
+                    else:
+                        sources_status["NCBI Gene"] = "⚠️ NO DATA (empty response)"
+                else:
+                    sources_status["NCBI Gene"] = f"❌ FAILED (HTTP {r2.status_code})"
+            else:
+                sources_status["NCBI Gene"] = "⚠️ GENE NOT FOUND"
+        else:
+            sources_status["NCBI Gene"] = f"❌ FAILED (HTTP {r.status_code})"
+            
+    except requests.exceptions.Timeout:
+        sources_status["NCBI Gene"] = "❌ TIMEOUT"
+    except Exception as e:
+        sources_status["NCBI Gene"] = f"❌ ERROR: {str(e)[:50]}"
+    
+    # =========================================
+    # 2. UniProt
+    # =========================================
+    try:
+        uniprot_url = "https://rest.uniprot.org/uniprotkb/search"
+        params = {
+            "query": f"gene_exact:{gene_symbol} AND organism_id:9606 AND reviewed:true",
+            "fields": "accession,protein_name,cc_function,cc_disease",
+            "format": "json",
+            "size": 1
+        }
+        headers = {"Accept": "application/json"}
+        
+        r = requests.get(uniprot_url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+        
+        if r.ok:
+            data = r.json()
+            results = data.get("results", [])
+            
+            if results:
+                found_info = True
+                sources_status["UniProt"] = "✅ SUCCESS"
+                entry = results[0]
+                
+                protein_name = entry.get("proteinDescription", {}).get("recommendedName", {}).get("fullName", {}).get("value", "")
+                if protein_name:
+                    output.append(f"\n**Protein Name:** {protein_name}")
+                
+                accession = entry.get("primaryAccession", "")
+                if accession:
+                    output.append(f"**UniProt ID:** {accession}")
+                
+                comments = entry.get("comments", [])
+                for comment in comments:
+                    if comment.get("commentType") == "FUNCTION":
+                        texts = comment.get("texts", [])
+                        if texts:
+                            func_text = texts[0].get("value", "")
+                            if func_text and "Function:" not in "\n".join(output):
+                                if len(func_text) > 400:
+                                    func_text = func_text[:400] + "..."
+                                output.append(f"\n**Protein Function:**\n{func_text}")
+                    
+                    if comment.get("commentType") == "DISEASE":
+                        disease = comment.get("disease", {})
+                        disease_name = disease.get("diseaseId", "")
+                        if disease_name:
+                            output.append(f"\n**Associated Disease:** {disease_name}")
+                            break
+            else:
+                sources_status["UniProt"] = "⚠️ GENE NOT FOUND"
+        else:
+            sources_status["UniProt"] = f"❌ FAILED (HTTP {r.status_code})"
+            
+    except requests.exceptions.Timeout:
+        sources_status["UniProt"] = "❌ TIMEOUT"
+    except Exception as e:
+        sources_status["UniProt"] = f"❌ ERROR: {str(e)[:50]}"
+    
+    # =========================================
+    # DATA SOURCE STATUS SUMMARY
+    # =========================================
+    output.append("\n" + "="*50)
+    output.append("**DATA SOURCE STATUS:**")
+    for source, status in sources_status.items():
+        output.append(f"  • {source}: {status}")
+    
+    if not found_info:
+        output.append("\n❌ **NO AUTHORITATIVE DATA RETRIEVED**")
+        output.append(f"Gene '{gene_symbol}' was not found in any database.")
+        output.append("⚠️ DO NOT make claims about this gene - admit you cannot find information.")
+    
+    return "\n".join(output)
+
+
+# =========================================
+# GENE TISSUE EXPRESSION TOOL
+# =========================================
+@tool
+def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
+    """
+    Get gene expression data using a Split-Strategy:
+    1. Resolves input to Gencode ID (for GTEx) and Official Symbol (for AtlasApprox).
+    2. Queries databases using their preferred format.
+    
+    Args:
+        gene_symbol: Gene name (e.g., "EGFLAM", "TP53")
+        tissue: Optional tissue filter (e.g., "Brain", "Liver")
+    """
+    input_symbol = gene_symbol.strip()
+    output = [f"**Expression Analysis for {input_symbol}**"]
+    if tissue:
+        output.append(f"Focus: {tissue}\n")
+    
+    # =========================================
+    # STEP 0: THE BRIDGE (RESOLVER)
+    # We use Ensembl to get the exact ID for GTEx and the Official Symbol for Atlas
+    # =========================================
+    gtex_id = None
+    atlas_symbol = input_symbol.upper() # Default to input if resolution fails
+    
+    try:
+        # Lookup by symbol in Ensembl
+        # We use 'expand=1' to potentially get synonyms if direct lookup fails
+        ens_url = f"https://rest.ensembl.org/lookup/symbol/homo_sapiens/{input_symbol}"
+        headers = {"Content-Type": "application/json"}
+        r_ens = requests.get(ens_url, headers=headers, timeout=5)
+        
+        if r_ens.ok:
+            data = r_ens.json()
+            gtex_id = data.get("id")              # e.g., ENSG00000164318 (Perfect for GTEx)
+            atlas_symbol = data.get("display_name") # e.g., EGFLAM (Perfect for AtlasApprox)
+            output.append(f"(Resolved '{input_symbol}' -> ID: {gtex_id} | Symbol: {atlas_symbol})")
+        else:
+            # Fallback: If Ensembl fails, we try to guess for GTEx later
+            output.append(f"(Warning: Could not resolve '{input_symbol}' to Ensembl ID. GTEx lookup might fail.)")
+            
+    except Exception as e:
+        output.append(f"(Resolution warning: {str(e)[:50]})")
+
+    sources_status = {"GTEx": "❌ NOT QUERIED", "AtlasApprox": "❌ NOT QUERIED"}
+
+    # =========================================
+    # 1. GTEx (Bulk RNA-seq) -> USES ID
+    # =========================================
+    if gtex_id:
+        try:
+            # We query expression using the Gencode ID we found
+            exp_url = "https://gtexportal.org/api/v2/expression/medianGeneExpression"
+            exp_params = {
+                "gencodeId": gtex_id, 
+                "datasetId": "gtex_v8", 
+                "format": "json"
+            }
+            r_exp = requests.get(exp_url, params=exp_params, headers={"Accept": "application/json"}, timeout=10)
+            
+            if r_exp.ok:
+                data = r_exp.json()
+                expressions = data.get("data", [])
+                if expressions:
+                    sources_status["GTEx"] = "✅ SUCCESS"
+                    output.append("\n📊 **Bulk RNA-seq (GTEx v8 TPM):**")
+                    sorted_exp = sorted(expressions, key=lambda x: x.get("median", 0), reverse=True)
+                    
+                    if tissue:
+                        t_lower = tissue.lower()
+                        sorted_exp = [e for e in sorted_exp if t_lower in e.get("tissueSiteDetailId", "").lower()]
+                    
+                    if sorted_exp:
+                        for exp in sorted_exp[:8]:
+                            output.append(f"  • {exp.get('tissueSiteDetailId')}: {exp.get('median', 0):.2f}")
+                    else:
+                        output.append(f"  (Low/No expression found in '{tissue}' specifically)")
+                else:
+                    sources_status["GTEx"] = "⚠️ NO DATA"
+            else:
+                sources_status["GTEx"] = f"❌ API ERROR {r_exp.status_code}"
+        except Exception as e:
+            sources_status["GTEx"] = f"❌ ERROR: {str(e)[:50]}"
+    else:
+        sources_status["GTEx"] = "⚠️ SKIPPED (No Gencode ID)"
+
+    # =========================================
+    # 2. AtlasApprox (Single Cell) -> USES SYMBOL
+    # =========================================
+    try:
+        # We use the 'atlas_symbol' we resolved earlier
+        
+        # A. Resolve Organ (Atlas is strict about organ names)
+        valid_organ = None
+        if tissue:
+            r_org = requests.get("https://api.atlasapprox.org/v1/organs", params={"organism": "h_sapiens"}, timeout=5)
+            if r_org.ok:
+                for vo in r_org.json().get("organs", []):
+                    if tissue.lower() in vo or vo in tissue.lower():
+                        valid_organ = vo
+                        break
+        
+        # B. Query
+        if tissue and valid_organ:
+            aa_url = "https://api.atlasapprox.org/v1/average"
+            aa_params = {"organism": "h_sapiens", "features": atlas_symbol, "organ": valid_organ}
+            r = requests.get(aa_url, params=aa_params, timeout=10)
+            
+            if r.ok:
+                data = r.json()
+                if "celltypes" in data:
+                    sources_status["AtlasApprox"] = f"✅ SUCCESS ({valid_organ})"
+                    output.append(f"\n🔬 **Single-Cell ({valid_organ}):**")
+                    ct_data = sorted(zip(data["celltypes"], data["average"]), key=lambda x: x[1], reverse=True)
+                    for ct, avg in ct_data:
+                        if avg > 0: output.append(f"  • {ct}: {avg:.2f}")
+                    if all(x[1] == 0 for x in ct_data):
+                        output.append(f"  (Detected but 0 expression in {valid_organ})")
+                else:
+                    sources_status["AtlasApprox"] = "⚠️ ORGAN EMPTY"
+        else:
+            # Global fallback
+            aa_url = "https://api.atlasapprox.org/v1/highest_measurement"
+            aa_params = {"organism": "h_sapiens", "feature": atlas_symbol, "number": 10}
+            r = requests.get(aa_url, params=aa_params, timeout=10)
+            if r.ok:
+                data = r.json()
+                if "celltypes" in data:
+                    sources_status["AtlasApprox"] = "✅ SUCCESS (Global)"
+                    output.append(f"\n🔬 **Single-Cell (Global Top 10 for {atlas_symbol}):**")
+                    for i in range(len(data["celltypes"])):
+                        output.append(f"  • {data['celltypes'][i]} ({data['organs'][i]}): {data['average'][i]:.2f}")
+                        
+    except Exception as e:
+        sources_status["AtlasApprox"] = f"❌ ERROR: {str(e)[:50]}"
+
+    output.append("\n" + "="*30)
+    output.append(f"STATUS: GTEx={sources_status['GTEx']} | Atlas={sources_status['AtlasApprox']}")
+    return "\n".join(output)
+
+# =========================================
+# SCREEN GraphQL HELPER FUNCTION
+# =========================================
+
+def query_screen_graphql(chrom: str, start: int, end: int, assembly: str = "GRCh38") -> dict:
+    """
+    Query SCREEN using the new GraphQL API.
+    
+    The old REST API at screen.encodeproject.org is deprecated.
+    New endpoint: https://screen.api.wenglab.org/graphql
+    """
+    url = "https://screen.api.wenglab.org/graphql"
+    
+    # Ensure chromosome has 'chr' prefix
+    if not chrom.startswith("chr"):
+        chrom = f"chr{chrom}"
+    
+    query = """
+    query cCREs($coordinates: [GenomicRegionInput!], $assembly: String!) {
+        ccres(coordinates: $coordinates, assembly: $assembly) {
+            accession
+            group
+            dnase
+            h3k4me3
+            h3k27ac
+            ctcf
+        }
+    }
+    """
+    
+    variables = {
+        "coordinates": [{
+            "chromosome": chrom,
+            "start": int(start),
+            "end": int(end)
+        }],
+        "assembly": assembly
+    }
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    
+    r = requests.post(url, json={"query": query, "variables": variables}, 
+                     headers=headers, timeout=REQUEST_TIMEOUT)
+    return r
+
+
+def query_screen_ccre_details(accession: str, assembly: str = "GRCh38") -> dict:
+    """
+    Query detailed cCRE information including tissue-specific activity.
+    """
+    url = "https://screen.api.wenglab.org/graphql"
+    
+    query = """
+    query cCREDetails($accession: String!, $assembly: String!) {
+        ccre(accession: $accession, assembly: $assembly) {
+            accession
+            group
+            coordinates {
+                chromosome
+                start
+                end
+            }
+            ctspecific {
+                biosample_summary
+                dnase_zscore
+                h3k4me3_zscore
+                h3k27ac_zscore
+                ctcf_zscore
+            }
+        }
+    }
+    """
+    
+    variables = {
+        "accession": accession,
+        "assembly": assembly
+    }
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    
+    r = requests.post(url, json={"query": query, "variables": variables},
+                     headers=headers, timeout=REQUEST_TIMEOUT)
+    return r
+
+
+# =========================================
+# REGULATORY TISSUE ACTIVITY TOOL
+# FIXED: Uses new GraphQL API with REST API fallback
+# =========================================
+
+@tool
+def regulatory_tissue_activity_tool(chromosome: str, start: int, end: int, tissue: str) -> str:
+    """
+    Check if a genomic region has active regulatory elements in a specific tissue.
+    
+    Uses ENCODE SCREEN database to find candidate cis-Regulatory Elements (cCREs)
+    and their activity (DNase/H3K27ac Z-scores) in tissue-matched biosamples.
+    
+    Args:
+        chromosome: Chromosome number (e.g., "17" or "chr17")
+        start: Start position (GRCh38)
+        end: End position (GRCh38)
+        tissue: Tissue name (e.g., "liver", "lung", "brain")
+    
+    Returns:
+        Regulatory activity status with DATA SOURCE STATUS
+    """
+    chrom = chromosome.replace("chr", "")
+    
+    output = [f"**Regulatory Activity Analysis**"]
+    output.append(f"Region: chr{chrom}:{start:,}-{end:,}")
+    output.append(f"Tissue: {tissue}\n")
+    
+    sources_status = {
+        "ENCODE SCREEN (GraphQL)": "❌ NOT QUERIED",
+        "ENCODE SCREEN Details": "❌ NOT QUERIED"
+    }
+    any_real_data = False
+    
+    # =========================================
+    # Try new GraphQL API first
+    # =========================================
+    try:
+        r = query_screen_graphql(chrom, start, end)
+        
+        if r.ok:
+            data = r.json()
+            
+            # Check for GraphQL errors
+            if "errors" in data:
+                error_msg = data["errors"][0].get("message", "Unknown error")[:100]
+                sources_status["ENCODE SCREEN (GraphQL)"] = f"❌ GraphQL ERROR - {error_msg}"
+                output.append(f"⚠️ SCREEN GraphQL error: {error_msg}")
+            else:
+                ccres = data.get("data", {}).get("ccres", [])
+                
+                if not ccres:
+                    sources_status["ENCODE SCREEN (GraphQL)"] = "✅ SUCCESS (0 cCREs found)"
+                    output.append("❌ **No regulatory elements found at this location.**")
+                    output.append("This region may not have annotated cCREs in ENCODE SCREEN.")
+                else:
+                    any_real_data = True
+                    sources_status["ENCODE SCREEN (GraphQL)"] = f"✅ SUCCESS ({len(ccres)} cCREs)"
+                    output.append(f"Found **{len(ccres)} cCRE(s)** at this location:\n")
+                    
+                    tissue_lower = tissue.lower()
+                    details_checked = 0
+                    details_failed = 0
+                    
+                    for ccre in ccres[:5]:
+                        accession = ccre.get("accession", "Unknown")
+                        element_type = ccre.get("group", "Unknown")
+                        
+                        output.append(f"**{accession}** ({element_type})")
+                        
+                        # Get detailed tissue-specific information
+                        try:
+                            d_r = query_screen_ccre_details(accession)
+                            
+                            if d_r.ok:
+                                d_data = d_r.json()
+                                
+                                if "errors" not in d_data:
+                                    details_checked += 1
+                                    ccre_detail = d_data.get("data", {}).get("ccre", {})
+                                    activity_data = ccre_detail.get("ctspecific", []) or []
+                                    
+                                    matches = []
+                                    for entry in activity_data:
+                                        bio_name = str(entry.get("biosample_summary", "")).lower()
+                                        
+                                        if tissue_lower in bio_name:
+                                            z_score = entry.get("dnase_zscore") or entry.get("h3k27ac_zscore", 0)
+                                            if z_score and float(z_score) > 1.64:
+                                                sample_name = entry.get("biosample_summary", "Unknown")
+                                                matches.append(f"{sample_name} (Z={float(z_score):.1f})")
+                                    
+                                    if matches:
+                                        output.append(f"  ✅ **ACTIVE in {tissue}**")
+                                        output.append(f"     Evidence: {', '.join(matches[:3])}")
+                                    else:
+                                        output.append(f"  ❌ No significant activity in {tissue}")
+                                else:
+                                    details_failed += 1
+                                    output.append(f"  ⚠️ Details fetch failed (GraphQL error)")
+                            else:
+                                details_failed += 1
+                                output.append(f"  ⚠️ Details fetch failed (HTTP {d_r.status_code})")
+                                
+                        except Exception as e:
+                            details_failed += 1
+                            output.append(f"  ⚠️ Error: {str(e)[:50]}")
+                        
+                        output.append("")
+                    
+                    if details_checked > 0:
+                        sources_status["ENCODE SCREEN Details"] = f"✅ {details_checked} checked, {details_failed} failed"
+                    else:
+                        sources_status["ENCODE SCREEN Details"] = "❌ ALL FAILED"
+        else:
+            error_detail = ""
+            try:
+                error_detail = f" - {r.text[:100]}"
+            except:
+                pass
+            sources_status["ENCODE SCREEN (GraphQL)"] = f"❌ HTTP {r.status_code}{error_detail}"
+            output.append(f"❌ SCREEN GraphQL API error: HTTP {r.status_code}{error_detail}")
+        
+    except requests.exceptions.Timeout:
+        sources_status["ENCODE SCREEN (GraphQL)"] = "❌ TIMEOUT"
+        output.append("⚠️ SCREEN GraphQL API timeout")
+    except Exception as e:
+        sources_status["ENCODE SCREEN (GraphQL)"] = f"❌ ERROR: {str(e)[:50]}"
+        output.append(f"Error: {str(e)}")
+    
+    # =========================================
+    # DATA SOURCE STATUS SUMMARY
+    # =========================================
+    output.append("\n" + "="*50)
+    output.append("**DATA SOURCE STATUS:**")
+    for source, status in sources_status.items():
+        output.append(f"  • {source}: {status}")
+    
+    if not any_real_data:
+        output.append("\n❌ **NO REGULATORY DATA RETRIEVED**")
+        output.append("⚠️ DO NOT make claims about regulatory activity without verified data.")
+    
+    return "\n".join(output)
+
+
+# =========================================
+# TE TISSUE ACTIVITY TOOL
+# FIXED: Uses new GraphQL API
+# =========================================
+
+@tool  
+def te_tissue_activity_tool(chromosome: str, start: int, end: int, tissue: str) -> str:
+    """
+    Check if a Transposable Element (TE) region shows transcriptional activity.
+    
+    This provides INDIRECT evidence only. For definitive TE quantification,
+    use specialized tools like TEtranscripts or SQuIRE on raw RNA-seq data.
+    
+    Args:
+        chromosome: Chromosome (e.g., "17" or "chr17")
+        start: TE start position (GRCh38)
+        end: TE end position (GRCh38)
+        tissue: Tissue name (e.g., "liver", "placenta")
+    
+    Returns:
+        Evidence summary with DATA SOURCE STATUS
+    """
+    chrom = chromosome.replace("chr", "")
+    
+    output = [f"**Transposable Element Activity Analysis**"]
+    output.append(f"Region: chr{chrom}:{start:,}-{end:,}")
+    output.append(f"Tissue: {tissue}\n")
+    
+    sources_status = {
+        "ENCODE SCREEN (chromatin)": "❌ NOT QUERIED",
+        "ENCODE RNA-seq search": "❌ NOT QUERIED",
+        "ENCODE H3K36me3 search": "❌ NOT QUERIED"
+    }
+    evidence_score = 0
+    
+    # 1. Chromatin state using GraphQL
+    output.append("**1. Chromatin State:**")
+    try:
+        r = query_screen_graphql(chrom, start, end)
+        
+        if r.ok:
+            data = r.json()
+            
+            if "errors" not in data:
+                ccres = data.get("data", {}).get("ccres", [])
+                
+                if ccres:
+                    sources_status["ENCODE SCREEN (chromatin)"] = f"✅ SUCCESS ({len(ccres)} elements)"
+                    output.append(f"   Found {len(ccres)} regulatory element(s) overlapping this TE")
+                    
+                    for ccre in ccres[:2]:
+                        acc = ccre.get("accession")
+                        try:
+                            d_r = query_screen_ccre_details(acc)
+                            if d_r.ok:
+                                d_data = d_r.json()
+                                if "errors" not in d_data:
+                                    activity = d_data.get("data", {}).get("ccre", {}).get("ctspecific", []) or []
+                                    
+                                    for entry in activity:
+                                        bio_name = str(entry.get("biosample_summary", "")).lower()
+                                        if tissue.lower() in bio_name:
+                                            z = entry.get("dnase_zscore", 0)
+                                            if z and float(z) > 1.64:
+                                                output.append(f"   ✅ Open chromatin in {tissue} (Z={float(z):.1f})")
+                                                evidence_score += 2
+                                                break
+                        except:
+                            pass
+                else:
+                    sources_status["ENCODE SCREEN (chromatin)"] = "✅ SUCCESS (0 elements - closed chromatin)"
+                    output.append("   ❌ No regulatory elements at this location (closed chromatin)")
+            else:
+                sources_status["ENCODE SCREEN (chromatin)"] = f"❌ GraphQL ERROR"
+                output.append(f"   ⚠️ SCREEN API error")
+        else:
+            sources_status["ENCODE SCREEN (chromatin)"] = f"❌ HTTP {r.status_code}"
+            output.append(f"   ⚠️ SCREEN API error: HTTP {r.status_code}")
+            
+    except requests.exceptions.Timeout:
+        sources_status["ENCODE SCREEN (chromatin)"] = "❌ TIMEOUT"
+        output.append("   ⚠️ Timeout")
+    except Exception as e:
+        sources_status["ENCODE SCREEN (chromatin)"] = f"❌ ERROR"
+        output.append(f"   ⚠️ Error: {str(e)[:50]}")
+    
+    # 2. RNA-seq datasets
+    output.append("\n**2. Transcription Evidence (RNA-seq):**")
+    try:
+        encode_url = "https://www.encodeproject.org/search/"
+        params = {
+            "type": "Experiment",
+            "assay_term_name": "polyA plus RNA-seq",
+            "biosample_ontology.term_name": tissue,
+            "status": "released",
+            "format": "json",
+            "limit": 5
+        }
+        headers = {"Accept": "application/json"}
+        
+        r = requests.get(encode_url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+        
+        if r.ok:
+            data = r.json()
+            experiments = data.get("@graph", [])
+            
+            if experiments:
+                sources_status["ENCODE RNA-seq search"] = f"✅ SUCCESS ({len(experiments)} datasets)"
+                output.append(f"   Found {len(experiments)} RNA-seq datasets for {tissue}")
+                output.append(f"   (Manual inspection needed to check TE expression)")
+                evidence_score += 1
+            else:
+                sources_status["ENCODE RNA-seq search"] = "⚠️ NO DATASETS"
+                output.append(f"   No RNA-seq data available for {tissue}")
+        else:
+            sources_status["ENCODE RNA-seq search"] = f"❌ HTTP {r.status_code}"
+            output.append(f"   ⚠️ ENCODE API error: HTTP {r.status_code}")
+            
+    except requests.exceptions.Timeout:
+        sources_status["ENCODE RNA-seq search"] = "❌ TIMEOUT"
+        output.append("   ⚠️ Timeout")
+    except Exception as e:
+        sources_status["ENCODE RNA-seq search"] = f"❌ ERROR"
+        output.append(f"   ⚠️ Error: {str(e)[:50]}")
+    
+    # 3. H3K36me3 (transcription mark)
+    output.append("\n**3. Elongation Mark (H3K36me3):**")
+    try:
+        encode_url = "https://www.encodeproject.org/search/"
+        params = {
+            "type": "Experiment",
+            "assay_term_name": "Histone ChIP-seq",
+            "target.label": "H3K36me3",
+            "biosample_ontology.term_name": tissue,
+            "status": "released",
+            "format": "json",
+            "limit": 3
+        }
+        headers = {"Accept": "application/json"}
+        
+        r = requests.get(encode_url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+        
+        if r.ok:
+            data = r.json()
+            experiments = data.get("@graph", [])
+            
+            if experiments:
+                sources_status["ENCODE H3K36me3 search"] = f"✅ SUCCESS ({len(experiments)} datasets)"
+                output.append(f"   Found {len(experiments)} H3K36me3 datasets for {tissue}")
+                output.append(f"   (Peak overlap would indicate active transcription)")
+                evidence_score += 1
+            else:
+                sources_status["ENCODE H3K36me3 search"] = "⚠️ NO DATASETS"
+                output.append(f"   No H3K36me3 data for {tissue}")
+        else:
+            sources_status["ENCODE H3K36me3 search"] = f"❌ HTTP {r.status_code}"
+                
+    except requests.exceptions.Timeout:
+        sources_status["ENCODE H3K36me3 search"] = "❌ TIMEOUT"
+    except Exception as e:
+        sources_status["ENCODE H3K36me3 search"] = f"❌ ERROR"
+    
+    # Summary
+    output.append("\n" + "="*50)
+    
+    if evidence_score >= 3:
+        output.append(f"**ASSESSMENT: LIKELY ACTIVE** (evidence score: {evidence_score})")
+    elif evidence_score >= 1:
+        output.append(f"**ASSESSMENT: POSSIBLY ACTIVE** (evidence score: {evidence_score})")
+    else:
+        output.append(f"**ASSESSMENT: LIKELY SILENT** (evidence score: {evidence_score})")
+    
+    output.append("\n⚠️ **NOTE:** This is INDIRECT evidence only.")
+    output.append("For definitive TE expression: use TEtranscripts or SQuIRE on raw RNA-seq.")
+    
+    # DATA SOURCE STATUS
+    output.append("\n" + "="*50)
+    output.append("**DATA SOURCE STATUS:**")
+    for source, status in sources_status.items():
+        output.append(f"  • {source}: {status}")
+    
+    all_failed = all("❌" in status or "TIMEOUT" in status for status in sources_status.values())
+    if all_failed:
+        output.append("\n❌ **ALL DATA SOURCES FAILED**")
+        output.append("⚠️ DO NOT make claims about TE activity without verified data.")
+    
+    return "\n".join(output)
+
+
+# =========================================
+# GENE COORDINATES TOOL
+# =========================================
+
+@tool
+def get_gene_coordinates_tool(gene_symbol: str) -> str:
+    """
+    Get genomic coordinates for a gene (useful for regulatory/TE queries).
+    
+    Args:
+        gene_symbol: Gene name (e.g., "TP53", "EGFR")
+    
+    Returns:
+        Chromosome, start, end coordinates (GRCh38) with DATA SOURCE STATUS
+    """
+    # Normalize gene symbol
+    gene_symbol = gene_symbol.strip().upper()
+    
+    output = []
+    sources_status = {"Ensembl REST API": "❌ NOT QUERIED"}
+    
+    try:
+        url = f"https://rest.ensembl.org/lookup/symbol/homo_sapiens/{gene_symbol}"
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        
+        r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        
+        if r.ok:
+            data = r.json()
+            chrom = data.get("seq_region_name", "Unknown")
+            start = data.get("start", 0)
+            end = data.get("end", 0)
+            strand = "+" if data.get("strand", 1) == 1 else "-"
+            
+            sources_status["Ensembl REST API"] = "✅ SUCCESS"
+            
+            output.append(f"**{gene_symbol}** coordinates (GRCh38):")
+            output.append(f"  Chromosome: {chrom}")
+            output.append(f"  Start: {start:,}")
+            output.append(f"  End: {end:,}")
+            output.append(f"  Strand: {strand}")
+            output.append(f"  Ensembl ID: {data.get('id', 'N/A')}")
+        elif r.status_code == 404:
+            sources_status["Ensembl REST API"] = "⚠️ GENE NOT FOUND"
+            output.append(f"Gene '{gene_symbol}' not found in Ensembl")
+        else:
+            sources_status["Ensembl REST API"] = f"❌ HTTP {r.status_code}"
+            output.append(f"Ensembl API error: HTTP {r.status_code}")
+            
+    except requests.exceptions.Timeout:
+        sources_status["Ensembl REST API"] = "❌ TIMEOUT"
+        output.append("Ensembl API timeout")
+    except Exception as e:
+        sources_status["Ensembl REST API"] = f"❌ ERROR"
+        output.append(f"Error: {str(e)}")
+    
+    # DATA SOURCE STATUS
+    output.append("\n" + "="*50)
+    output.append("**DATA SOURCE STATUS:**")
+    for source, status in sources_status.items():
+        output.append(f"  • {source}: {status}")
+    
+    return "\n".join(output)
 
 # ============================================
 # AGENT SETUP
@@ -599,20 +1399,131 @@ def explore_kg_entity_tool(entity_name: str) -> str:
 
 memory = MemorySaver()
 
-system_prompt = """You are a PubMed research assistant with Knowledge Graph integration.
+system_prompt = """You are a biomedical research assistant with access to PubMed literature, a biomedical knowledge graph, and genomic expression databases.
 
-TOOLS:
-1. pubmed_search_and_store_tool - Search PubMed and store papers
-2. search_rag_database_tool - Search stored papers with KG enhancement  
-3. check_rag_for_topic_tool - Check if papers exist for a topic
-4. get_database_stats_tool - Get database statistics
-5. verify_facts_tool - Verify claims against knowledge graph
-6. explore_kg_entity_tool - Explore entities in knowledge graph
+## ⚠️ CRITICAL RULE: VERIFY GENES BEFORE ANSWERING
 
-RULES:
-- Only cite PMIDs from tool results
-- Use KG context when provided
-- Never invent facts or citations"""
+**ALWAYS use `gene_info_tool` FIRST before answering ANY question about a gene.**
+
+This prevents hallucination. Do NOT guess what a gene does based on its name.
+
+Example - WRONG approach:
+  User: "What does EGFLAM do?"
+  Assistant: "EGFLAM is related to EGF signaling..." ← HALLUCINATION!
+
+Example - CORRECT approach:
+  User: "What does EGFLAM do?"
+  Assistant: [calls gene_info_tool("EGFLAM")]
+  Assistant: "According to NCBI Gene, EGFLAM encodes EGF-like, fibronectin type III and laminin G domains protein..."
+
+## AVAILABLE TOOLS
+
+### Gene Information (USE FIRST!)
+
+1. **gene_info_tool**(gene_symbol) ⭐ ALWAYS USE FIRST FOR GENE QUESTIONS
+   - Get authoritative gene information from NCBI Gene and UniProt
+   - Returns: Official name, function, aliases, disease associations
+   - **MANDATORY** before answering questions about what a gene does
+   - Example: `gene_symbol="EGFLAM"` → official function from databases
+
+### Literature & Knowledge Graph Tools
+
+2. **pubmed_search_and_store_tool**(keywords, years, pnum)
+   - Search PubMed and store papers in the local database
+   - Example: `keywords="EGFR lung cancer therapy", years="2022-2024", pnum=10`
+
+3. **search_rag_database_tool**(query, num_results)
+   - Search stored papers with KG-enhanced retrieval
+   - Returns relevant chunks with PMID citations
+
+4. **check_rag_for_topic_tool**(keywords)
+   - Quick check if papers exist for a topic before searching
+
+5. **get_database_stats_tool**()
+   - Get database and knowledge graph statistics
+
+6. **verify_facts_tool**(text)
+   - Verify claims against the knowledge graph
+
+7. **explore_kg_entity_tool**(entity_name)
+   - Explore an entity's relationships in the knowledge graph
+
+### Genomic Expression Tools
+
+8. **gene_tissue_expression_tool**(gene_symbol, tissue=None)
+   - Get gene expression data across tissues
+   - Sources: GTEx (bulk RNA-seq TPM), AtlasApprox (single-cell)
+   - Example: `gene_symbol="EGFR", tissue="Lung"`
+
+9. **regulatory_tissue_activity_tool**(chromosome, start, end, tissue)
+   - Check if a genomic region has active regulatory elements
+   - Uses ENCODE SCREEN database for cCRE activity
+
+10. **te_tissue_activity_tool**(chromosome, start, end, tissue)
+    - Check if a Transposable Element shows activity in a tissue
+
+11. **get_gene_coordinates_tool**(gene_symbol)
+    - Get genomic coordinates (chr, start, end) for a gene
+
+## WORKFLOW FOR GENE QUESTIONS
+
+### Step 1: ALWAYS verify the gene first
+```
+User: "What does GENEX do?"
+→ Call gene_info_tool("GENEX")
+→ Read the official function from NCBI/UniProt
+→ ONLY THEN answer based on the tool output
+```
+
+### Step 2: If asked about expression, call expression tool
+```
+→ Call gene_tissue_expression_tool("GENEX")
+→ Report actual TPM values from GTEx
+```
+
+### Step 3: If gene not found
+```
+gene_info_tool returns "NO AUTHORITATIVE DATA FOUND"
+→ Tell the user: "I could not find information about this gene in NCBI Gene or UniProt databases."
+→ Do NOT guess or make up information!
+```
+
+## RULES
+
+1. **Gene Verification**: ALWAYS call `gene_info_tool` before making claims about ANY gene. If the tool says "NO AUTHORITATIVE DATA FOUND", admit you cannot find information - do NOT guess.
+
+2. **Citations**: Only cite PMIDs from tool results. Never invent citations.
+
+3. **Expression Data**: 
+   - GTEx values are in TPM (Transcripts Per Million)
+   - Always mention the data source
+   - Don't claim expression without calling the expression tool
+
+4. **Regulatory Activity**: Z-score > 1.64 = significant (p < 0.05)
+
+5. **TE Activity**: Recommend validation with TEtranscripts/SQuIRE for definitive answers
+
+6. **Uncertainty**: If tools fail or return no data, say so clearly. Never guess.
+
+7. **Coordinates**: All genomic coordinates use GRCh38/hg38.
+"""
+
+# system_prompt = """You are a PubMed research assistant with Knowledge Graph integration.
+
+# TOOLS:
+# 1. pubmed_search_and_store_tool - Search PubMed and store papers
+# 2. search_rag_database_tool - Search stored papers with KG enhancement  
+# 3. check_rag_for_topic_tool - Check if papers exist for a topic
+# 4. get_database_stats_tool - Get database statistics
+# 5. verify_facts_tool - Verify claims against knowledge graph
+# 6. explore_kg_entity_tool - Explore entities in knowledge graph
+
+# RULES:
+# - Only cite PMIDs from tool results
+# - Use KG context when provided
+# - Never invent facts or citations
+# """
+
 
 tools = [
     pubmed_search_and_store_tool,
@@ -621,6 +1532,11 @@ tools = [
     get_database_stats_tool,
     verify_facts_tool,
     explore_kg_entity_tool,
+    gene_tissue_expression_tool,
+    regulatory_tissue_activity_tool,
+    te_tissue_activity_tool,
+    get_gene_coordinates_tool,
+    gene_info_tool
 ]
 
 pubmed_agent = create_agent(
