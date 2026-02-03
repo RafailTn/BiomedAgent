@@ -779,8 +779,6 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
     - Checking if a gene is broadly expressed in a tissue
     - GTEx data is the gold standard for tissue transcriptomics
     
-    For single-cell resolution (specific cell types), use gene_census_expression_tool instead.
-    
     Args:
         gene_symbol: Gene name (e.g., "TERT", "EGFR", "TP53") or Ensembl ID
         tissue: Optional tissue filter (e.g., "Lung", "Brain", "Liver", "Heart")
@@ -796,8 +794,7 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
         - "EGFR levels in brain vs lung"
         - "Which tissues express TP53 highest?"
     
-    Note: GTEx measures bulk tissue averages. For specific cell type expression
-    (e.g., "fibroblasts" or "T-cells"), use gene_census_expression_tool.
+    Note: GTEx measures bulk tissue averages. 
     """
     input_symbol = gene_symbol.strip()
     output = [f"**GTEx Tissue Expression Analysis (Bulk RNA-seq)**"]
@@ -970,7 +967,6 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
         output.append(f"\n**Interpretation:**")
         output.append(f"• TPM = Transcripts Per Million (normalized for sequencing depth)")
         output.append(f"• Bulk RNA-seq measures average across all cells in tissue")
-        output.append(f"• For specific cell type expression, use gene_census_expression_tool")
         
         # Highlight if expression is tissue-specific or ubiquitous
         top_tpm = sorted_exp[0].get("median", 0)
@@ -1096,9 +1092,8 @@ system_prompt = """You are an advanced Biomedical Research Agent. Your goal is t
 # RESPONSE FORMATTING
 * **Gene Function:** Start with the official summary from `gene_info_tool`.
 * **Expression Data:**
-    * Clearly distinguish **Bulk** (GTEx) from **Single-Cell** (Census).
-    * Report the units (TPM for bulk, % expressing cells for single-cell).
-    * *Example:* "In bulk lung tissue, EGFR expression is moderate (Median TPM: 15.2). However, single-cell analysis shows it is highly specific to Basal Cells (85% expressing)."
+    * Report the units (TPM for bulk).
+    * *Example:* "In bulk lung tissue, EGFR expression is moderate (Median TPM: 15.2).
 * **Citations:** Use standard format `[PMID: 12345678]`.
 
 # EXECUTION LOOP
