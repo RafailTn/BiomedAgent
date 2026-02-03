@@ -1040,8 +1040,8 @@ def get_gene_coordinates_tool(gene_symbol: str) -> str:
             
             output.append(f"**{gene_symbol}** coordinates (GRCh38):")
             output.append(f"  Chromosome: {chrom}")
-            output.append(f"  Start: {start:,}")
-            output.append(f"  End: {end:,}")
+            output.append(f"  Start: {start}")
+            output.append(f"  End: {end}")       
             output.append(f"  Strand: {strand}")
             output.append(f"  Ensembl ID: {data.get('id', 'N/A')}")
         elif r.status_code == 404:
@@ -1069,33 +1069,22 @@ def get_gene_coordinates_tool(gene_symbol: str) -> str:
 class AlphaGenomeHandler:
     """
     Handler for Google DeepMind's AlphaGenome API.
-    Handles sequence context (1Mb window), tissue mapping, and multi-assay requests.
+    Fixes:
+    1. Handles BINNED output (128bp resolution) correctly to avoid 'Mean of empty slice'.
+    2. Ensures sequence is UPPERCASE.
+    3. Handles NaN values safely.
     """
     
     # Map common tissue names to UBERON IDs
     TISSUE_MAP = {
-        "lung": "UBERON:0002048",
-        "liver": "UBERON:0002107", 
-        "brain": "UBERON:0000955",
-        "heart": "UBERON:0000948",
-        "kidney": "UBERON:0002113",
-        "blood": "UBERON:0000178",
-        "skin": "UBERON:0002097",
-        "muscle": "UBERON:0001134"
+        "lung": "UBERON:0002048", "liver": "UBERON:0002107", "brain": "UBERON:0000955",
+        "heart": "UBERON:0000948", "kidney": "UBERON:0002113", "blood": "UBERON:0000178",
+        "skin": "UBERON:0002097", "muscle": "UBERON:0001134"
     }
 
-    # Map user-friendly strings to API Enums
     ASSAY_MAP = {
-        "dnase": "DNASE",
-        "atac": "ATAC",
-        "rna": "RNA_SEQ",
-        "cage": "CAGE",
-        "histone": "CHIP_HISTONE",
-        "tf": "CHIP_TF",
-        "splice_sites": "SPLICE_SITES",
-        "splice_usage": "SPLICE_SITE_USAGE",
-        "contacts": "CONTACT_MAPS",
-        "procap": "PROCAP"
+        "dnase": "DNASE", "atac": "ATAC", "rna": "RNA_SEQ", "cage": "CAGE",
+        "histone": "CHIP_HISTONE", "tf": "CHIP_TF", "splice_sites": "SPLICE_SITES"
     }
 
     def __init__(self, api_key):
@@ -1108,124 +1097,120 @@ class AlphaGenomeHandler:
             except Exception as e:
                 logger.error(f"AlphaGenome init failed: {e}")
 
-    def get_available_assays(self):
-        """Return list of valid assay keys."""
-        return list(self.ASSAY_MAP.keys())
-
-    def fetch_sequence(self, chrom, start, end):
-        """
-        Fetch sequence from Ensembl.
-        AlphaGenome requires a specific context window (exactly 2^20 bytes = 1,048,576 bp).
-        """
-        # Calculate window centered on target
+    def fetch_sequence_only(self, chrom, start, end):
+        """Fetch and clean sequence (1Mb window)."""
         center = (start + end) // 2
-        window_size = 1_048_576  # 1 MiB
+        window_size = 1_048_576
         
         seq_start = max(1, center - (window_size // 2))
         seq_end = seq_start + window_size - 1
         
-        # Ensembl REST API
         url = f"https://rest.ensembl.org/sequence/region/human/{chrom}:{seq_start}..{seq_end}"
         headers = {"Content-Type": "text/plain"}
         
-        # 'mask_feature=1' gets soft-masked sequence (repeats in lowercase)
-        r = requests.get(url, headers=headers, params={"mask_feature": 1}, timeout=15)
-        
-        if not r.ok:
-            raise ValueError(f"Ensembl Seq Fetch Failed: {r.status_code}")
-        
-        sequence = r.text
-        
-        # Handle edge cases where sequence is shorter than required (e.g., chromosome ends)
-        if len(sequence) != window_size:
-            padding_needed = window_size - len(sequence)
-            # Simple right-padding with 'N'
-            sequence = sequence + ("N" * padding_needed)
+        try:
+            r = requests.get(url, headers=headers, params={"mask_feature": 1}, timeout=15)
+            if not r.ok:
+                return None, f"Ensembl Error {r.status_code}: {r.text}"
             
-        return sequence, seq_start, seq_end
-
-    def predict_region(self, chrom, start, end, tissue="lung", assays=None):
-        """Run prediction on a genomic region with specified output tracks."""
-        if not self.client:
-            return "AlphaGenome client not available (check API Key or install library)."
-
-        uberon_id = self.TISSUE_MAP.get(tissue.lower(), "UBERON:0002048") # Default to Lung
-        
-        # Default assays if none provided
-        if not assays:
-            assays = ["dnase", "rna"]
+            # FIX: Ensure Upper Case immediately
+            sequence = r.text.upper()
             
-        # Resolve requested outputs to Enums
+            if len(sequence) != window_size:
+                padding = "N" * (window_size - len(sequence))
+                sequence = sequence + padding
+                
+            return sequence, None
+        except Exception as e:
+            return None, str(e)
+
+    def _extract_mean_signal(self, track_values, start_bp, end_bp, total_seq_len):
+        """
+        Helper: Safely extracts signal from binned or unbinned tracks.
+        """
+        track_len = len(track_values)
+        
+        # 1. Calculate Bin Size (Resolution)
+        # If track_len == seq_len, bin_size is 1. If track_len < seq_len, it's binned (e.g. 128).
+        bin_size = total_seq_len / track_len if track_len > 0 else 1
+        
+        # 2. Convert BP coordinates to Bin Indices
+        start_bin = int(start_bp / bin_size)
+        end_bin = int(end_bp / bin_size)
+        
+        # 3. Clamp indices to array bounds
+        start_bin = max(0, start_bin)
+        end_bin = min(track_len, end_bin)
+        
+        # 4. Handle "Single Bin" requests (if region is smaller than 1 bin)
+        if start_bin == end_bin:
+            end_bin = min(track_len, start_bin + 1)
+            
+        # 5. Extract Slice
+        slice_data = track_values[start_bin:end_bin]
+        
+        if len(slice_data) == 0:
+            return 0.0 # Prevent RuntimeWarning
+            
+        return float(np.mean(slice_data))
+
+    def predict_from_sequence(self, sequence, tissue="lung", assays=None):
+        if not self.client: return "AlphaGenome client not available."
+        
+        # Ensure Clean Input
+        sequence = sequence.upper().strip()
+        seq_len = len(sequence) # Should be 1,048,576
+
+        uberon_id = self.TISSUE_MAP.get(tissue.lower(), "UBERON:0002048")
+        if not assays: assays = ["dnase", "rna"]
+        
         requested_enums = []
-        if assays == "all":
-            requested_enums = [getattr(dna_client.OutputType, k) for k in self.ASSAY_MAP.values()]
-        else:
-            if isinstance(assays, str):
-                assays = [assays]
-            
-            for a in assays:
-                key = self.ASSAY_MAP.get(a.lower())
-                if key and hasattr(dna_client.OutputType, key):
-                    requested_enums.append(getattr(dna_client.OutputType, key))
-        
-        if not requested_enums:
-            return f"Invalid assay types requested. Valid options: {self.get_available_assays()}"
+        if isinstance(assays, str): assays = [x.strip() for x in assays.split(",")]
+        for a in assays:
+            key = self.ASSAY_MAP.get(a.lower())
+            if key and hasattr(dna_client.OutputType, key):
+                requested_enums.append(getattr(dna_client.OutputType, key))
+                
+        if not requested_enums: return "Invalid assay types."
 
         try:
-            # 1. Get Sequence Context
-            sequence, real_start, real_end = self.fetch_sequence(chrom, start, end)
-            
-            # 2. Call API
             output = self.client.predict_sequence(
                 sequence=sequence,
                 requested_outputs=requested_enums,
                 ontology_terms=[uberon_id]
             )
             
-            # 3. Format Output
-            # We must map the user's specific region to the returned 1Mb window
-            rel_start = start - real_start
-            rel_end = end - real_start
+            report = [f"**AlphaGenome Prediction**"]
+            report.append(f"Tissue: {tissue} ({uberon_id})")
             
-            # Validate relative indices
-            rel_start = max(0, rel_start)
-            rel_end = min(1_048_576, rel_end)
+            # Define ROI (Region of Interest) - Center 1kb
+            center_bp = seq_len // 2
+            roi_start = center_bp - 500
+            roi_end = center_bp + 500
             
-            if rel_start >= rel_end:
-                 return "Error: Requested region is outside the fetched context window."
-
-            report = [f"**AlphaGenome Prediction ({tissue})**"]
-            report.append(f"Region: {chrom}:{start}-{end}")
-            report.append(f"Context: 1Mb window centered at {real_start + 524288}")
-            report.append("-" * 40)
-
-            # Dynamically parse results
             for enum_val in requested_enums:
-                # The API returns attributes in lowercase (e.g. DNASE -> output.dnase)
                 attr_name = enum_val.name.lower()
-                
                 if hasattr(output, attr_name):
-                    track_data = getattr(output, attr_name)
-                    # Calculate mean signal for the requested region
-                    # Note: .values returns a numpy array
-                    val = np.mean(track_data.values[rel_start:rel_end])
+                    track = getattr(output, attr_name)
+                    # Use .values if it's a pandas/xarray object, otherwise use track directly
+                    vals = track.values if hasattr(track, "values") else track
+                    
+                    # FIX: Use helper to handle bins
+                    val = self._extract_mean_signal(vals, roi_start, roi_end, seq_len)
                     
                     report.append(f"• {attr_name.upper()}: {val:.4f}")
             
-            report.append("-" * 40)
-            report.append("Interpretation: Values are normalized (z-scores or log-like). >0 indicates high activity.")
-            
             return "\n".join(report)
-                    
+
         except Exception as e:
-            return f"AlphaGenome Error: {str(e)}"
+            return f"Prediction Error: {str(e)}"
 
 # Initialize global handler
 ag_handler = AlphaGenomeHandler(ALPHAGENOME_API_KEY)
 
 
 # ============================================
-# TOOL DEFINITION
+# TOOL DEFINITION (Modified)
 # ============================================
 
 @tool
@@ -1234,38 +1219,42 @@ def alphagenome_prediction_tool(query_type: str, location: str, tissue: str = "l
     Use AlphaGenome AI to predict properties of NON-CODING regions.
     
     Args:
-        query_type: "region" (currently the only supported mode)
-        location: Genomic coordinates in format "chr:start-end" (e.g. "chr7:55200000-55200500")
-        tissue: Target tissue type. Options: lung, liver, brain, heart, kidney, blood, skin, muscle.
-        assays: Comma-separated list of tracks to predict.
-                Options: dnase (accessibility), rna (expression), cage (promoters), 
-                histone (modifications), tf (binding), splice_sites.
-                Default: "dnase,rna"
-    
-    Returns:
-        Predicted values for the specified tracks in the target region.
+        query_type: "region"
+        location: Genomic coordinates "chr:start-end" (e.g. "chr7:55,200,000-55,200,500")
+        tissue: Target tissue (lung, liver, brain, heart, kidney, blood, skin, muscle)
+        assays: Comma-separated list (dnase, rna, cage, histone, tf, splice_sites)
     """
     if not ALPHAGENOME_AVAILABLE:
         return "AlphaGenome library is not installed on this server."
     
     try:
-        # Basic validation
-        if ":" not in location or "-" not in location:
-            return "Invalid format. Use 'chr:start-end' (e.g., 'chr1:1000-2000')."
+        # 1. CLEANUP INPUT (Comma/Space Fix)
+        clean_loc = location.replace(",", "").replace(" ", "").strip()
         
-        chrom, rng = location.split(":")
-        start, end = map(int, rng.split("-"))
+        if ":" not in clean_loc or "-" not in clean_loc:
+            return f"Invalid format '{location}'. Use 'chr:start-end' (e.g. chr1:1000-2000)."
         
-        # Parse comma-separated assays
-        assay_list = [x.strip() for x in assays.split(",")]
+        chrom, rng = clean_loc.split(":")
         
-        if query_type == "region":
-            return ag_handler.predict_region(chrom, start, end, tissue, assays=assay_list)
-        else:
-            return "Only 'region' mode is currently supported."
+        try:
+            start_str, end_str = rng.split("-")
+            start = int(start_str)
+            end = int(end_str)
+        except ValueError:
+             return f"Could not parse coordinates from '{location}'. Check for non-numeric characters."
+
+        # 2. FETCH SEQUENCE FIRST
+        # We explicitly grab the DNA string from Ensembl before predicting
+        sequence, error = ag_handler.fetch_sequence_only(chrom, start, end)
+        
+        if error:
+            return f"Failed to fetch DNA sequence from Ensembl: {error}"
+            
+        # 3. PREDICT FROM SEQUENCE
+        return ag_handler.predict_from_sequence(sequence, tissue=tissue, assays=assays)
             
     except Exception as e:
-        return f"Tool Execution Failed: {e}"
+        return f"Tool Execution Failed: {str(e)}"
 
 # ============================================
 # AGENT SETUP
@@ -1278,7 +1267,7 @@ system_prompt = """You are an advanced Biomedical Research Agent. Your goal is t
 # CRITICAL OPERATING RULES
 1. **NO HALLUCINATION:** Never guess gene functions, expression levels, or paper citations/links. If a tool returns no data, state "No data found."
 2. **VERIFY FIRST:** You must verify a gene's identity (using `gene_info_tool`) before discussing its function or expression.
-3. **CITE SOURCES:** Only cite PMIDs or data sources (e.g., "GTEx v10") that explicitly appear in tool outputs.
+3. **CITE SOURCES:** Only cite PMIDs or data sources (e.g., "GTEx v10", "AlphaGenome") that explicitly appear in tool outputs.
 
 # TOOL ROUTING GUIDE (How to choose the right tool)
 
@@ -1293,7 +1282,19 @@ system_prompt = """You are an advanced Biomedical Research Agent. Your goal is t
 * **Step 3: Coordinates (If asked about location)**
     * Use `get_gene_coordinates_tool(gene_symbol)`
 
-## CATEGORY 2: LITERATURE REVIEW ("Find papers on...", "Summarize studies...")
+## CATEGORY 2: PREDICTIONS & NON-CODING ("Analyze the promoter...", "Variant effect...")
+* **Step 1: Coordinates**
+    * Get coordinates using `get_gene_coordinates_tool` first.
+* **Step 2: Prediction**
+    * Use `alphagenome_prediction_tool` with the coordinates.
+    * **IMPORTANT:** This tool *automatically* fetches the DNA sequence from Ensembl for you. You do not need to provide the sequence yourself.
+    * **Parameters:**
+        * `assays="dnase,rna"` (Standard: Accessibility & Expression)
+        * `assays="histone,tf"` (Epigenetics: Histone marks & TF binding)
+        * `assays="cage,splice_sites"` (Promoters & Splicing)
+    * *Goal:* Predict epigenomic features for non-coding regions or specific genomic windows.
+
+## CATEGORY 3: LITERATURE REVIEW ("Find papers on...", "Summarize studies...")
 * **Step 1: Check Existing Knowledge**
     * Use `check_rag_for_topic_tool(keywords)` to see if we already have papers.
 * **Step 2: Search External (If needed)**
@@ -1301,21 +1302,13 @@ system_prompt = """You are an advanced Biomedical Research Agent. Your goal is t
 * **Step 3: Synthesize**
     * Use `search_rag_database_tool(query)` to answer using the stored papers and Knowledge Graph.
 
-## CATEGORY 3: PREDICTIONS & NON-CODING
-* **Step 1: Coordinates**
-    * Get coordinates using `get_gene_coordinates_tool`.
-* **Step 2: Prediction**
-    * Use `alphagenome_prediction_tool`
-    * **Standard:** `assays="dnase,rna"` (Chromatin & Expression)
-    * **Advanced:** * Ask for `assays="histone,tf"` to see epigenetic marks/binding.
-        * Ask for `assays="cage"` for precise promoter activity.
-        * Ask for `assays="splice_sites"` for variant splicing effects.
-
 # RESPONSE FORMATTING
 * **Gene Function:** Start with the official summary from `gene_info_tool`.
 * **Expression Data:**
     * Report the units (TPM for bulk).
-    * *Example:* "In bulk lung tissue, EGFR expression is moderate (Median TPM: 15.2).
+* **Predictions:**
+    * Clearly state that AlphaGenome results are *predicted* values, not experimental data.
+    * Interpret the values (e.g., "High DNase signal indicates open chromatin").
 * **Citations:** Use standard format `[PMID: 12345678]`.
 
 # EXECUTION LOOP
@@ -1324,6 +1317,58 @@ system_prompt = """You are an advanced Biomedical Research Agent. Your goal is t
 3. **Observe Output:** Read the tool's raw output.
 4. **Refine/Answer:** If tool fails (e.g., "Gene not found"), try an alias or report the error. If successful, synthesize the answer.
 """
+
+# system_prompt = """You are an advanced Biomedical Research Agent. Your goal is to provide fact-based, scientifically accurate answers using a specific set of computational tools.
+
+# # CRITICAL OPERATING RULES
+# 1. **NO HALLUCINATION:** Never guess gene functions, expression levels, or paper citations/links. If a tool returns no data, state "No data found."
+# 2. **VERIFY FIRST:** You must verify a gene's identity (using `gene_info_tool`) before discussing its function or expression.
+# 3. **CITE SOURCES:** Only cite PMIDs or data sources (e.g., "GTEx v10") that explicitly appear in tool outputs.
+
+# # TOOL ROUTING GUIDE (How to choose the right tool)
+
+# ## CATEGORY 1: GENE QUESTIONS ("What is GENE?", "Where is GENE expressed?")
+# * **Step 1: Identity (MANDATORY)**
+#     * Use `gene_info_tool(gene_symbol)`
+#     * *Goal:* Get the official symbol, summary, and aliases.
+# * **Step 2: Expression (If asked about tissues/cells)**
+#     * **Context: "Overall / Bulk tissue"** (e.g., "Is EGFR in the lung?")
+#         * Use `gene_tissue_expression_tool(gene_symbol, tissue)`
+#         * *Source:* GTEx (Bulk RNA-seq). Measures average expression in whole tissue samples.
+# * **Step 3: Coordinates (If asked about location)**
+#     * Use `get_gene_coordinates_tool(gene_symbol)`
+
+# ## CATEGORY 2: LITERATURE REVIEW ("Find papers on...", "Summarize studies...")
+# * **Step 1: Check Existing Knowledge**
+#     * Use `check_rag_for_topic_tool(keywords)` to see if we already have papers.
+# * **Step 2: Search External (If needed)**
+#     * Use `pubmed_search_and_store_tool(keywords, years, pnum)` to fetch new papers.
+# * **Step 3: Synthesize**
+#     * Use `search_rag_database_tool(query)` to answer using the stored papers and Knowledge Graph.
+
+# ## CATEGORY 3: PREDICTIONS & NON-CODING
+# * **Step 1: Coordinates**
+#     * Get coordinates using `get_gene_coordinates_tool`.
+# * **Step 2: Prediction**
+#     * Use `alphagenome_prediction_tool`
+#     * **Standard:** `assays="dnase,rna"` (Chromatin & Expression)
+#     * **Advanced:** * Ask for `assays="histone,tf"` to see epigenetic marks/binding.
+#         * Ask for `assays="cage"` for precise promoter activity.
+#         * Ask for `assays="splice_sites"` for variant splicing effects.
+
+# # RESPONSE FORMATTING
+# * **Gene Function:** Start with the official summary from `gene_info_tool`.
+# * **Expression Data:**
+#     * Report the units (TPM for bulk).
+#     * *Example:* "In bulk lung tissue, EGFR expression is moderate (Median TPM: 15.2).
+# * **Citations:** Use standard format `[PMID: 12345678]`.
+
+# # EXECUTION LOOP
+# 1. **Analyze Request:** Identify the biological entities (Genes, Tissues, Diseases).
+# 2. **Select Tool:** Pick the tool from the Routing Guide above.
+# 3. **Observe Output:** Read the tool's raw output.
+# 4. **Refine/Answer:** If tool fails (e.g., "Gene not found"), try an alias or report the error. If successful, synthesize the answer.
+# """
 
 tools = [
     pubmed_search_and_store_tool,
