@@ -43,6 +43,17 @@ from rank_bm25 import BM25Okapi
 from pathlib import Path
 import logging
 import requests
+import numpy as np
+# NEW: Import AlphaGenome (Wrap in try/except to prevent crash if not installed)
+try:
+    from alphagenome.models import dna_client
+    from alphagenome.data import genome
+    # Mocking Enums/Constants for context if library isn't present during dry-run
+    ALPHAGENOME_AVAILABLE = True
+except ImportError:
+    ALPHAGENOME_AVAILABLE = False
+    logger.warning("AlphaGenome library not found. Tool will be disabled.")
+
 # Import knowledge graph module
 from knowledge_graph import KnowledgeGraphManager
 
@@ -52,7 +63,7 @@ logger = logging.getLogger(__name__)
 REQUEST_TIMEOUT = 15
 
 load_dotenv()
-
+ALPHAGENOME_API_KEY = os.getenv("ALPHAGENOME_API_KEY")
 Entrez.email = "rafailadam46@gmail.com"
 
 
@@ -1055,6 +1066,207 @@ def get_gene_coordinates_tool(gene_symbol: str) -> str:
     
     return "\n".join(output)
 
+class AlphaGenomeHandler:
+    """
+    Handler for Google DeepMind's AlphaGenome API.
+    Handles sequence context (1Mb window), tissue mapping, and multi-assay requests.
+    """
+    
+    # Map common tissue names to UBERON IDs
+    TISSUE_MAP = {
+        "lung": "UBERON:0002048",
+        "liver": "UBERON:0002107", 
+        "brain": "UBERON:0000955",
+        "heart": "UBERON:0000948",
+        "kidney": "UBERON:0002113",
+        "blood": "UBERON:0000178",
+        "skin": "UBERON:0002097",
+        "muscle": "UBERON:0001134"
+    }
+
+    # Map user-friendly strings to API Enums
+    ASSAY_MAP = {
+        "dnase": "DNASE",
+        "atac": "ATAC",
+        "rna": "RNA_SEQ",
+        "cage": "CAGE",
+        "histone": "CHIP_HISTONE",
+        "tf": "CHIP_TF",
+        "splice_sites": "SPLICE_SITES",
+        "splice_usage": "SPLICE_SITE_USAGE",
+        "contacts": "CONTACT_MAPS",
+        "procap": "PROCAP"
+    }
+
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.client = None
+        if ALPHAGENOME_AVAILABLE and api_key:
+            try:
+                self.client = dna_client.create(api_key)
+                logger.info("AlphaGenome Client initialized.")
+            except Exception as e:
+                logger.error(f"AlphaGenome init failed: {e}")
+
+    def get_available_assays(self):
+        """Return list of valid assay keys."""
+        return list(self.ASSAY_MAP.keys())
+
+    def fetch_sequence(self, chrom, start, end):
+        """
+        Fetch sequence from Ensembl.
+        AlphaGenome requires a specific context window (exactly 2^20 bytes = 1,048,576 bp).
+        """
+        # Calculate window centered on target
+        center = (start + end) // 2
+        window_size = 1_048_576  # 1 MiB
+        
+        seq_start = max(1, center - (window_size // 2))
+        seq_end = seq_start + window_size - 1
+        
+        # Ensembl REST API
+        url = f"https://rest.ensembl.org/sequence/region/human/{chrom}:{seq_start}..{seq_end}"
+        headers = {"Content-Type": "text/plain"}
+        
+        # 'mask_feature=1' gets soft-masked sequence (repeats in lowercase)
+        r = requests.get(url, headers=headers, params={"mask_feature": 1}, timeout=15)
+        
+        if not r.ok:
+            raise ValueError(f"Ensembl Seq Fetch Failed: {r.status_code}")
+        
+        sequence = r.text
+        
+        # Handle edge cases where sequence is shorter than required (e.g., chromosome ends)
+        if len(sequence) != window_size:
+            padding_needed = window_size - len(sequence)
+            # Simple right-padding with 'N'
+            sequence = sequence + ("N" * padding_needed)
+            
+        return sequence, seq_start, seq_end
+
+    def predict_region(self, chrom, start, end, tissue="lung", assays=None):
+        """Run prediction on a genomic region with specified output tracks."""
+        if not self.client:
+            return "AlphaGenome client not available (check API Key or install library)."
+
+        uberon_id = self.TISSUE_MAP.get(tissue.lower(), "UBERON:0002048") # Default to Lung
+        
+        # Default assays if none provided
+        if not assays:
+            assays = ["dnase", "rna"]
+            
+        # Resolve requested outputs to Enums
+        requested_enums = []
+        if assays == "all":
+            requested_enums = [getattr(dna_client.OutputType, k) for k in self.ASSAY_MAP.values()]
+        else:
+            if isinstance(assays, str):
+                assays = [assays]
+            
+            for a in assays:
+                key = self.ASSAY_MAP.get(a.lower())
+                if key and hasattr(dna_client.OutputType, key):
+                    requested_enums.append(getattr(dna_client.OutputType, key))
+        
+        if not requested_enums:
+            return f"Invalid assay types requested. Valid options: {self.get_available_assays()}"
+
+        try:
+            # 1. Get Sequence Context
+            sequence, real_start, real_end = self.fetch_sequence(chrom, start, end)
+            
+            # 2. Call API
+            output = self.client.predict_sequence(
+                sequence=sequence,
+                requested_outputs=requested_enums,
+                ontology_terms=[uberon_id]
+            )
+            
+            # 3. Format Output
+            # We must map the user's specific region to the returned 1Mb window
+            rel_start = start - real_start
+            rel_end = end - real_start
+            
+            # Validate relative indices
+            rel_start = max(0, rel_start)
+            rel_end = min(1_048_576, rel_end)
+            
+            if rel_start >= rel_end:
+                 return "Error: Requested region is outside the fetched context window."
+
+            report = [f"**AlphaGenome Prediction ({tissue})**"]
+            report.append(f"Region: {chrom}:{start}-{end}")
+            report.append(f"Context: 1Mb window centered at {real_start + 524288}")
+            report.append("-" * 40)
+
+            # Dynamically parse results
+            for enum_val in requested_enums:
+                # The API returns attributes in lowercase (e.g. DNASE -> output.dnase)
+                attr_name = enum_val.name.lower()
+                
+                if hasattr(output, attr_name):
+                    track_data = getattr(output, attr_name)
+                    # Calculate mean signal for the requested region
+                    # Note: .values returns a numpy array
+                    val = np.mean(track_data.values[rel_start:rel_end])
+                    
+                    report.append(f"• {attr_name.upper()}: {val:.4f}")
+            
+            report.append("-" * 40)
+            report.append("Interpretation: Values are normalized (z-scores or log-like). >0 indicates high activity.")
+            
+            return "\n".join(report)
+                    
+        except Exception as e:
+            return f"AlphaGenome Error: {str(e)}"
+
+# Initialize global handler
+ag_handler = AlphaGenomeHandler(ALPHAGENOME_API_KEY)
+
+
+# ============================================
+# TOOL DEFINITION
+# ============================================
+
+@tool
+def alphagenome_prediction_tool(query_type: str, location: str, tissue: str = "lung", assays: str = "dnase,rna") -> str:
+    """
+    Use AlphaGenome AI to predict properties of NON-CODING regions.
+    
+    Args:
+        query_type: "region" (currently the only supported mode)
+        location: Genomic coordinates in format "chr:start-end" (e.g. "chr7:55200000-55200500")
+        tissue: Target tissue type. Options: lung, liver, brain, heart, kidney, blood, skin, muscle.
+        assays: Comma-separated list of tracks to predict.
+                Options: dnase (accessibility), rna (expression), cage (promoters), 
+                histone (modifications), tf (binding), splice_sites.
+                Default: "dnase,rna"
+    
+    Returns:
+        Predicted values for the specified tracks in the target region.
+    """
+    if not ALPHAGENOME_AVAILABLE:
+        return "AlphaGenome library is not installed on this server."
+    
+    try:
+        # Basic validation
+        if ":" not in location or "-" not in location:
+            return "Invalid format. Use 'chr:start-end' (e.g., 'chr1:1000-2000')."
+        
+        chrom, rng = location.split(":")
+        start, end = map(int, rng.split("-"))
+        
+        # Parse comma-separated assays
+        assay_list = [x.strip() for x in assays.split(",")]
+        
+        if query_type == "region":
+            return ag_handler.predict_region(chrom, start, end, tissue, assays=assay_list)
+        else:
+            return "Only 'region' mode is currently supported."
+            
+    except Exception as e:
+        return f"Tool Execution Failed: {e}"
+
 # ============================================
 # AGENT SETUP
 # ============================================
@@ -1089,6 +1301,16 @@ system_prompt = """You are an advanced Biomedical Research Agent. Your goal is t
 * **Step 3: Synthesize**
     * Use `search_rag_database_tool(query)` to answer using the stored papers and Knowledge Graph.
 
+## CATEGORY 3: PREDICTIONS & NON-CODING
+* **Step 1: Coordinates**
+    * Get coordinates using `get_gene_coordinates_tool`.
+* **Step 2: Prediction**
+    * Use `alphagenome_prediction_tool`
+    * **Standard:** `assays="dnase,rna"` (Chromatin & Expression)
+    * **Advanced:** * Ask for `assays="histone,tf"` to see epigenetic marks/binding.
+        * Ask for `assays="cage"` for precise promoter activity.
+        * Ask for `assays="splice_sites"` for variant splicing effects.
+
 # RESPONSE FORMATTING
 * **Gene Function:** Start with the official summary from `gene_info_tool`.
 * **Expression Data:**
@@ -1113,6 +1335,7 @@ tools = [
     gene_tissue_expression_tool,
     get_gene_coordinates_tool,
     gene_info_tool,
+    alphagenome_prediction_tool
 ]
 
 pubmed_agent = create_agent(
