@@ -45,6 +45,7 @@ import logging
 import requests
 # Import knowledge graph module
 from knowledge_graph import KnowledgeGraphManager
+# from cellxgene_census_tool import singlecell_gene_expression_tool, singlecell_cell_types_tool
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -816,7 +817,7 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
         gtex_gene_url = "https://gtexportal.org/api/v2/reference/gene"
         params = {
             "geneId": input_symbol.upper(),
-            "gencodeVersion": "v26",  # GTEx v8 uses Gencode v26
+            "gencodeVersion": "v39",  # GTEx v10 uses Gencode v39
             "genomeBuild": "GRCh38/hg38",
             "page": 0,
             "itemsPerPage": 10  # Allow multiple matches for ambiguous symbols
@@ -875,13 +876,13 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
         exp_url = "https://gtexportal.org/api/v2/expression/medianGeneExpression"
         exp_params = {
             "gencodeId": gtex_id,  # Versioned Gencode ID required
-            "datasetId": "gtex_v8",
+            "datasetId": "gtex_v10",
             "format": "json"
         }
         
         headers = {"Accept": "application/json"}
         
-        output.append(f"Querying GTEx v8 expression data...")
+        output.append(f"Querying GTEx v10 expression data...")
         
         r_exp = requests.get(exp_url, params=exp_params, headers=headers, timeout=15)
         
@@ -1065,12 +1066,75 @@ def get_gene_coordinates_tool(gene_symbol: str) -> str:
 
 memory = MemorySaver()
 
+
+# system_prompt = """You are an advanced Biomedical Research Agent. Your goal is to provide fact-based, scientifically accurate answers using a specific set of computational tools.
+
+# # CRITICAL OPERATING RULES
+# 1. **NO HALLUCINATION:** Never guess gene functions, expression levels, or paper citations. If a tool returns no data, state "No data found."
+# 2. **VERIFY FIRST:** You must verify a gene's identity (using `gene_info_tool`) before discussing its function or expression.
+# 3. **CITE SOURCES:** Only cite PMIDs or data sources (e.g., "GTEx v10", "CellxGene Census") that explicitly appear in tool outputs.
+
+# # TOOL ROUTING GUIDE (How to choose the right tool)
+
+# ## CATEGORY 1: GENE QUESTIONS ("What is GENE?", "Where is GENE expressed?")
+# * **Step 1: Identity (MANDATORY)**
+#     * Use `gene_info_tool(gene_symbol)`
+#     * *Goal:* Get the official symbol, summary, and aliases.
+# * **Step 2: Expression (If asked about tissues/cells)**
+#     * **Context: "Overall / Bulk tissue"** (e.g., "Is EGFR in the lung?")
+#         * Use `gene_tissue_expression_tool(gene_symbol, tissue)`
+#         * *Source:* GTEx (Bulk RNA-seq). Measures average expression in whole tissue samples.
+#     * **Context: "Cell-type resolution / Single-cell"** (e.g., "Which lung cells express EGFR?")
+#         * Use `singlecell_gene_expression_tool(gene, tissue)`
+#         * *Source:* CellxGene Census (60M+ single cells). Returns % expressing by cell type.
+# * **Step 3: Coordinates (If asked about location)**
+#     * Use `get_gene_coordinates_tool(gene_symbol)`
+
+# ## CATEGORY 2: SINGLE-CELL EXPLORATION
+# * **What cell types are in a tissue?**
+#     * Use `singlecell_cell_types_tool(tissue)` to list cell types and their abundance
+# * **Cell-type specific expression:**
+#     * Use `singlecell_gene_expression_tool(gene, tissue)` for cell-type breakdown
+
+# ## EXPRESSION DATA COMPARISON:
+# | Data Type | Tool | Resolution | Units | Use Case |
+# |-----------|------|------------|-------|----------|
+# | **Bulk tissue** | `gene_tissue_expression_tool` | Whole tissue | TPM | "Is GENE expressed in lung?" |
+# | **Single-cell** | `singlecell_gene_expression_tool` | By cell type | % expressing, counts | "Which lung cells express GENE?" |
+
+# ## CATEGORY 3: LITERATURE REVIEW ("Find papers on...", "Summarize studies...")
+# * **Step 1: Check Existing Knowledge**
+#     * Use `check_rag_for_topic_tool(keywords)` to see if we already have papers.
+# * **Step 2: Search External (If needed)**
+#     * Use `pubmed_search_and_store_tool(keywords, years, pnum)` to fetch new papers.
+# * **Step 3: Synthesize**
+#     * Use `search_rag_database_tool(query)` to answer using the stored papers and Knowledge Graph.
+
+# # RESPONSE FORMATTING
+# * **Gene Function:** Start with the official summary from `gene_info_tool`.
+# * **Expression Data:**
+#     * Clearly distinguish **Bulk** (GTEx) from **Single-Cell** (Census).
+#     * Report the units:
+#       - GTEx: Median TPM (transcripts per million) 
+#       - Census: % expressing cells, mean raw counts
+#     * *Example:* "In bulk lung tissue, EGFR expression is moderate (Median TPM: 15.2, GTEx). 
+#       At single-cell resolution (CellxGene Census), EGFR shows cell-type specificity:
+#       85% of basal cells express it vs only 12% of alveolar cells."
+# * **Citations:** Use standard format `[PMID: 12345678]` or `[Source: GTEx v10]` / `[Source: CellxGene Census]`.
+
+# # EXECUTION LOOP
+# 1. **Analyze Request:** Identify the biological entities (Genes, Tissues, Diseases, Cell Types).
+# 2. **Select Tool:** Pick the tool from the Routing Guide above.
+# 3. **Observe Output:** Read the tool's raw output.
+# 4. **Refine/Answer:** If tool fails (e.g., "Gene not found"), try an alias or report the error. If successful, synthesize the answer.
+# """
+
 system_prompt = """You are an advanced Biomedical Research Agent. Your goal is to provide fact-based, scientifically accurate answers using a specific set of computational tools.
 
 # CRITICAL OPERATING RULES
 1. **NO HALLUCINATION:** Never guess gene functions, expression levels, or paper citations. If a tool returns no data, state "No data found."
 2. **VERIFY FIRST:** You must verify a gene's identity (using `gene_info_tool`) before discussing its function or expression.
-3. **CITE SOURCES:** Only cite PMIDs or data sources (e.g., "GTEx v8") that explicitly appear in tool outputs.
+3. **CITE SOURCES:** Only cite PMIDs or data sources (e.g., "GTEx v10") that explicitly appear in tool outputs.
 
 # TOOL ROUTING GUIDE (How to choose the right tool)
 
@@ -1117,7 +1181,9 @@ tools = [
     explore_kg_entity_tool,
     gene_tissue_expression_tool,
     get_gene_coordinates_tool,
-    gene_info_tool
+    gene_info_tool,
+    # singlecell_cell_types_tool,
+    # singlecell_gene_expression_tool
 ]
 
 pubmed_agent = create_agent(
