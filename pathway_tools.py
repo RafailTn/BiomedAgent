@@ -602,20 +602,46 @@ class KEGGClient:
                     if pid.startswith(org_code):
                         pathway_ids.append(pid)
         
-        # Get pathway names
+        # Get pathway names using batch request
+        # KEGG allows fetching multiple entries at once with + separator
         pathways = []
-        for pid in pathway_ids[:20]:  # Limit to avoid too many requests
-            info_result = self._request("list", f"path:{pid}")
-            if not info_result.startswith("ERROR"):
-                for line in info_result.strip().split("\n"):
-                    if "\t" in line:
-                        name = line.split("\t")[1]
-                        pathways.append({
-                            "pathway_id": pid,
-                            "name": name.replace(" - Homo sapiens (human)", "").strip(),
-                            "url": f"https://www.kegg.jp/kegg-bin/show_pathway?{pid}+{gene}",
-                        })
-                        break
+        
+        if pathway_ids:
+            # Batch fetch pathway info (up to 10 at a time)
+            for i in range(0, min(len(pathway_ids), 20), 10):
+                batch = pathway_ids[i:i+10]
+                batch_ids = "+".join([f"path:{pid}" for pid in batch])
+                
+                info_result = self._request("get", batch_ids)
+                
+                if not info_result.startswith("ERROR"):
+                    # Parse each entry in the batch response
+                    current_pid = None
+                    current_name = None
+                    
+                    for line in info_result.split("\n"):
+                        if line.startswith("ENTRY"):
+                            # Extract pathway ID from ENTRY line
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                current_pid = parts[1]
+                        elif line.startswith("NAME"):
+                            # Extract pathway name
+                            current_name = line.replace("NAME", "").strip()
+                            current_name = current_name.replace(" - Homo sapiens (human)", "").strip()
+                            
+                            if current_pid and current_name:
+                                pathways.append({
+                                    "pathway_id": current_pid,
+                                    "name": current_name,
+                                    "url": f"https://www.kegg.jp/kegg-bin/show_pathway?{current_pid}+{gene}",
+                                })
+                            current_pid = None
+                            current_name = None
+                        elif line.startswith("///"):
+                            # End of entry marker
+                            current_pid = None
+                            current_name = None
         
         return {
             "gene": gene,
@@ -1046,6 +1072,16 @@ try:
                        
         Returns:
             Pathway details including genes and description.
+            
+        Common pathway IDs:
+            - hsa04110: Cell cycle
+            - hsa04210: Apoptosis
+            - hsa04151: PI3K-Akt signaling
+            - hsa04010: MAPK signaling
+            - hsa04310: Wnt signaling
+            - hsa04350: TGF-beta signaling
+            - hsa04150: mTOR signaling
+            - hsa05200: Pathways in cancer
         """
         client = _get_kegg()
         result = client.get_pathway(pathway_id)
