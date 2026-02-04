@@ -61,18 +61,6 @@ from alphagenome_tool import (
     alphagenome_variant_effect,
     alphagenome_available_tracks,
 )
-from pathway_tools import (
-    # STRING
-    string_get_interactions,
-    string_functional_enrichment,
-    string_network_image,
-    # KEGG
-    kegg_search_pathways,
-    kegg_get_pathway,
-    kegg_find_pathways_for_gene,
-    kegg_find_pathways_for_genes,
-    kegg_disease_pathways,
-)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -787,235 +775,6 @@ def gene_info_tool(gene_symbol: str) -> str:
     
     return "\n".join(output)
 
-
-# =========================================
-# GENE TISSUE EXPRESSION TOOL
-# =========================================
-
-@tool
-def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
-    """
-    Query gene expression from GTEx (bulk RNA-seq across human tissues).
-    
-    This tool provides tissue-level expression data from the Genotype-Tissue 
-    Expression (GTEx) project. It measures average expression across all cells
-    in a tissue sample (bulk RNA-seq), which is complementary to single-cell data.
-    
-    Use this when:
-    - You need tissue-level expression quantification (TPM values)
-    - Comparing expression across different tissues
-    - Checking if a gene is broadly expressed in a tissue
-    - GTEx data is the gold standard for tissue transcriptomics
-    
-    Args:
-        gene_symbol: Gene name (e.g., "TERT", "EGFR", "TP53") or Ensembl ID
-        tissue: Optional tissue filter (e.g., "Lung", "Brain", "Liver", "Heart")
-    
-    Returns:
-        Tissue expression levels in TPM (Transcripts Per Million):
-        - Median expression across tissue samples
-        - Rank of tissues by expression level
-        - Sample size (number of donors)
-    
-    Example queries:
-        - "TERT expression across all tissues"
-        - "EGFR levels in brain vs lung"
-        - "Which tissues express TP53 highest?"
-    
-    Note: GTEx measures bulk tissue averages. 
-    """
-    input_symbol = gene_symbol.strip()
-    output = [f"**GTEx Tissue Expression Analysis (Bulk RNA-seq)**"]
-    output.append(f"Gene: {input_symbol}")
-    if tissue:
-        output.append(f"Tissue focus: {tissue}")
-    output.append("")
-    
-    # =========================================
-    # STEP 1: Resolve gene symbol to GTEx Gencode ID
-    # =========================================
-    gtex_id = None
-    official_symbol = input_symbol.upper()
-    
-    try:
-        gtex_gene_url = "https://gtexportal.org/api/v2/reference/gene"
-        params = {
-            "geneId": input_symbol.upper(),
-            "gencodeVersion": "v39",  # GTEx v10 uses Gencode v39
-            "genomeBuild": "GRCh38/hg38",
-            "page": 0,
-            "itemsPerPage": 10  # Allow multiple matches for ambiguous symbols
-        }
-        headers = {"Accept": "application/json"}
-        
-        r_gtex = requests.get(gtex_gene_url, params=params, headers=headers, timeout=10)
-        
-        if r_gtex.ok:
-            data = r_gtex.json()
-            gene_data = data.get("data", [])
-            
-            if gene_data:
-                # Take the first (best) match
-                best_match = gene_data[0]
-                gtex_id = best_match.get("gencodeId")  # Versioned ID: ENSG...XX.X
-                official_symbol = best_match.get("geneSymbol", input_symbol.upper())
-                
-                # Get additional info if available
-                description = best_match.get("description", "")
-                
-                output.append(f"✅ Resolved: {official_symbol}")
-                output.append(f"   GTEx ID: {gtex_id}")
-                if description:
-                    output.append(f"   Description: {description}")
-                output.append("")
-            else:
-                output.append(f"⚠️  Warning: '{input_symbol}' not found in GTEx reference database.")
-                output.append(f"   The gene may not be protein-coding or may have an alternative symbol.")
-                output.append(f"   Try using the official HGNC symbol or Ensembl ID.")
-                output.append("")
-        else:
-            output.append(f"⚠️  Warning: GTEx gene lookup failed (HTTP {r_gtex.status_code}).")
-            output.append(f"   Cannot resolve symbol to GTEx ID.")
-            output.append("")
-            
-    except requests.exceptions.Timeout:
-        output.append(f"❌ Error: GTEx gene lookup timed out.")
-        return "\n".join(output)
-    except Exception as e:
-        output.append(f"❌ Error resolving gene: {str(e)[:100]}")
-        return "\n".join(output)
-
-    # =========================================
-    # STEP 2: Query GTEx expression data
-    # =========================================
-    if not gtex_id:
-        output.append("❌ Cannot query expression without valid GTEx ID.")
-        output.append("\nSuggestions:")
-        output.append("- Check the gene symbol spelling")
-        output.append("- Try using the Ensembl ID (e.g., ENSG00000164318.9)")
-        output.append("- Use gene_info_tool to find the official gene symbol")
-        return "\n".join(output)
-    
-    try:
-        exp_url = "https://gtexportal.org/api/v2/expression/medianGeneExpression"
-        exp_params = {
-            "gencodeId": gtex_id,  # Versioned Gencode ID required
-            "datasetId": "gtex_v10",
-            "format": "json"
-        }
-        
-        headers = {"Accept": "application/json"}
-        
-        output.append(f"Querying GTEx v10 expression data...")
-        
-        r_exp = requests.get(exp_url, params=exp_params, headers=headers, timeout=15)
-        
-        if not r_exp.ok:
-            output.append(f"❌ GTEx API error: HTTP {r_exp.status_code}")
-            if r_exp.status_code == 400:
-                output.append(f"   The Gencode ID may be invalid or not present in GTEx.")
-            return "\n".join(output)
-        
-        data = r_exp.json()
-        expressions = data.get("data", [])
-        
-        if not expressions:
-            output.append(f"⚠️  No expression data returned for {official_symbol}.")
-            output.append(f"   This gene may not be expressed or may be below detection threshold.")
-            return "\n".join(output)
-        
-        # =========================================
-        # STEP 3: Process and display results
-        # =========================================
-        output.append(f"✅ Found expression data across {len(expressions)} tissues\n")
-        
-        # Sort by median expression (descending)
-        sorted_exp = sorted(expressions, key=lambda x: x.get("median", 0), reverse=True)
-        
-        # Filter by tissue if specified
-        if tissue:
-            tissue_lower = tissue.lower()
-            filtered_exp = [
-                e for e in sorted_exp 
-                if tissue_lower in e.get("tissueSiteDetailId", "").lower()
-            ]
-            
-            if filtered_exp:
-                output.append(f"**Expression in '{tissue}' tissues:**")
-                output.append(f"{'Tissue':<35} {'Median TPM':>12} {'n':>5}")
-                output.append(f"{'-'*35} {'-'*12} {'-'*5}")
-                
-                for exp in filtered_exp[:10]:  # Show top 10 matches
-                    tissue_name = exp.get("tissueSiteDetailId", "Unknown")[:34]
-                    median = exp.get("median", 0)
-                    n_samples = exp.get("nSamples", "N/A")
-                    
-                    output.append(
-                        f"{tissue_name:<35} "
-                        f"{median:>11.2f} "
-                        f"{str(n_samples):>5}"
-                    )
-                
-                if len(filtered_exp) > 10:
-                    output.append(f"\n... and {len(filtered_exp) - 10} more tissue subtypes")
-                    
-            else:
-                output.append(f"⚠️  No tissues matching '{tissue}' found.")
-                output.append(f"   Available tissues include:")
-                # Show top 5 tissues as suggestions
-                for exp in sorted_exp[:5]:
-                    output.append(f"   • {exp.get('tissueSiteDetailId')}")
-        
-        else:
-            # Show top expressed tissues
-            output.append(f"**Top 10 Tissues by Expression:**")
-            output.append(f"{'Rank':<5} {'Tissue':<35} {'Median TPM':>12} {'n':>5}")
-            output.append(f"{'-'*5} {'-'*35} {'-'*12} {'-'*5}")
-            
-            for rank, exp in enumerate(sorted_exp[:10], 1):
-                tissue_name = exp.get("tissueSiteDetailId", "Unknown")[:34]
-                median = exp.get("median", 0)
-                n_samples = exp.get("nSamples", "N/A")
-                
-                output.append(
-                    f"{rank:<5} "
-                    f"{tissue_name:<35} "
-                    f"{median:>11.2f} "
-                    f"{str(n_samples):>5}"
-                )
-            
-            # Summary statistics
-            all_medians = [e.get("median", 0) for e in expressions]
-            output.append(f"\n**Summary Statistics:**")
-            output.append(f"  Tissues analyzed: {len(expressions)}")
-            output.append(f"  Highest expression: {sorted_exp[0].get('tissueSiteDetailId')} ({sorted_exp[0].get('median'):.2f} TPM)")
-            output.append(f"  Lowest expression: {sorted_exp[-1].get('tissueSiteDetailId')} ({sorted_exp[-1].get('median'):.2f} TPM)")
-        
-        # Add interpretation
-        output.append(f"\n**Interpretation:**")
-        output.append(f"• TPM = Transcripts Per Million (normalized for sequencing depth)")
-        output.append(f"• Bulk RNA-seq measures average across all cells in tissue")
-        
-        # Highlight if expression is tissue-specific or ubiquitous
-        top_tpm = sorted_exp[0].get("median", 0)
-        median_tpm = sorted(all_medians)[len(all_medians)//2] if all_medians else 0
-        
-        if top_tpm > 10 * median_tpm and top_tpm > 10:
-            output.append(f"• **Tissue-specific**: High expression in {sorted_exp[0].get('tissueSiteDetailId')} with low expression elsewhere")
-        elif median_tpm > 1:
-            output.append(f"• **Broadly expressed**: Detected across most tissues")
-        else:
-            output.append(f"• **Low expression**: Generally low expression across tissues")
-        
-        return "\n".join(output)
-        
-    except requests.exceptions.Timeout:
-        output.append(f"❌ Error: GTEx expression query timed out.")
-        return "\n".join(output)
-    except Exception as e:
-        output.append(f"❌ Error querying GTEx: {str(e)[:100]}")
-        return "\n".join(output)
-    
 # =========================================
 # GENE COORDINATES TOOL
 # =========================================
@@ -1092,124 +851,59 @@ memory = MemorySaver()
 system_prompt = """You are an advanced Biomedical Research Agent. Your goal is to provide fact-based, scientifically accurate answers using a specific set of computational tools.
 
 # CRITICAL OPERATING RULES
+1. **NO HALLUCINATION:** Never guess gene functions, expression levels, or paper citations/links. If a tool returns no data, state "No data found."
+2. **VERIFY FIRST:** You must verify a gene's identity (using `gene_info_tool`) before discussing its function or expression.
+3. **CITE SOURCES:** Only cite PMIDs or data sources (e.g. "AlphaGenome") that explicitly appear in tool outputs.
 
-## RULE 1: MANDATORY TOOL USE (NO EXCEPTIONS)
-You MUST use tools before providing ANY factual biomedical information:
-- **Pathways** → Use `kegg_search_pathways` or `kegg_get_pathway` FIRST
-- **Gene info** → Use `gene_info_tool` FIRST  
-- **Interactions** → Use `string_get_interactions` FIRST
-- **Literature** → Use `check_rag_for_topic_tool` or `pubmed_search_and_store_tool` FIRST
+# TOOL ROUTING GUIDE (How to choose the right tool)
 
-❌ NEVER answer from memory alone. Even if you "know" about cGAS-STING, TP53, or any pathway, YOU MUST CALL A TOOL FIRST.
-
-## RULE 2: CITATION INTEGRITY (ZERO TOLERANCE FOR FAKE CITATIONS)
-⚠️ **THIS IS THE MOST IMPORTANT RULE** ⚠️
-
-**NEVER write a PMID unless it appears VERBATIM in a tool output.**
-
-- ✅ ALLOWED: "According to KEGG pathway hsa04064..." (tool returned this)
-- ✅ ALLOWED: "[PMID: 12345678]" (tool returned this exact PMID)
-- ❌ FORBIDDEN: "[PMID: 29625051]" (you remembered this - DO NOT USE)
-- ❌ FORBIDDEN: "Studies have shown [PMID: xxxxxxxx]" (invented citation)
-
-**If no tool returns citations:**
-- Say: "Based on KEGG pathway data..." or "According to STRING database..."
-- Say: "I don't have specific papers on this topic. Would you like me to search PubMed?"
-- DO NOT invent PMIDs to make your answer look more authoritative
-
-## RULE 3: NO HALLUCINATION
-- If a tool returns no data, state "No data found" or offer to search
-- Never guess gene functions, expression levels, or paper citations
-- If uncertain, use another tool or ask for clarification
-
-# TOOL ROUTING GUIDE
-
-## CATEGORY 1: PATHWAY QUESTIONS ("Show me X pathway", "How does X signaling work")
-**⚠️ MANDATORY: Call KEGG before answering ANY pathway question**
-
-* **Step 1: Search for pathway**
-    * Use `kegg_search_pathways(query="cGAS-STING")` or `kegg_search_pathways(query="apoptosis")`
-* **Step 2: Get pathway details**
-    * Use `kegg_get_pathway(pathway_id="hsa04064")` to get genes and description
-* **Step 3: If user wants papers**
-    * Use `pubmed_search_and_store_tool(keywords="cGAS STING pathway", years=5, pnum=10)`
-
-**Common pathway IDs:**
-- hsa04064: NF-kappa B signaling (includes cGAS-STING components)
-- hsa04621: NOD-like receptor signaling
-- hsa04622: RIG-I-like receptor signaling  
-- hsa04623: Cytosolic DNA-sensing pathway (cGAS-STING)
-- hsa04210: Apoptosis
-- hsa04110: Cell cycle
-- hsa04151: PI3K-Akt signaling
-
-## CATEGORY 2: GENE QUESTIONS ("What is GENE?", "Where is GENE expressed?")
+## CATEGORY 1: GENE QUESTIONS ("What is GENE?", "Where is GENE expressed?")
 * **Step 1: Identity (MANDATORY)**
     * Use `gene_info_tool(gene_symbol)`
-* **Step 2: Expression (If asked)**
-    * Use `gene_tissue_expression_tool(gene_symbol, tissue)`
-* **Step 3: Coordinates (If asked)**
+    * *Goal:* Get the official symbol, summary, and aliases.
+* **Step 3: Coordinates (If asked about location)**
     * Use `get_gene_coordinates_tool(gene_symbol)`
 
-## CATEGORY 3: PROTEIN INTERACTIONS ("What interacts with X?")
-* **Step 1: Get interactions (MANDATORY)**
-    * Use `string_get_interactions(proteins="STING1", min_score=700)`
-* **Step 2: Functional enrichment (optional)**
-    * Use `string_functional_enrichment(proteins="CGAS,STING1,TBK1,IRF3")`
-* **Step 3: Find pathways for gene list**
-    * Use `kegg_find_pathways_for_genes(genes="CGAS,STING1,TBK1")`
-
-## CATEGORY 4: PREDICTIONS & NON-CODING
+## CATEGORY 2: PREDICTIONS & NON-CODING ("Analyze the promoter...", "Variant effect...")
 * **Step 1: Coordinates**
-    * Use `get_gene_coordinates_tool` first
-* **Step 2: Prediction**
-    * Use `alphagenome_predict(location, tissue, assays, ...)`
-    * Or `alphagenome_variant_effect(location, ref_allele, alt_allele, ...)`
+    * Get coordinates using `get_gene_coordinates_tool` first.
+* **Step 2: Check Availability (Optional)**
+    * If asked about specific TFs or Histone marks (e.g., "Does CTCF bind here?"), verify coverage first.
+    * Use `alphagenome_available_tracks(output_type="tf", tissue="...")`
+* **Step 3: Select Prediction Type**
+    * **A. General Region Analysis** ("Analyze the promoter of TP53")
+        * Use `alphagenome_predict(location, tissue, assays, ...)`
+        * **Assays:**
+            * `atac,dnase` (Chromatin Accessibility)
+            * `rna,cage` (Gene Expression & TSS)
+            * `histone,tf` (Epigenetics - Use `filter_tf="CTCF"` to narrow down)
+            * `splice,contacts` (Splicing & 3D Structure)
+        * *Tip:* Use `compare_tissues="liver,brain"` if the user asks for comparisons.
+    * **B. Variant/Mutation Analysis** ("What is the effect of A>G at chr1:100?", "Score rs12345")
+        * Use `alphagenome_variant_effect(location, ref_allele, alt_allele, ...)`
+        * *Goal:* Predict how a specific mutation changes epigenomic signals (REF vs ALT).
 
-## CATEGORY 5: LITERATURE REVIEW ("Find papers on...", "What do studies say...")
-* **Step 1: Check existing knowledge**
-    * Use `check_rag_for_topic_tool(keywords="cGAS STING")`
-* **Step 2: Search if needed**
-    * Use `pubmed_search_and_store_tool(keywords="...", years=5, pnum=10)`
+## CATEGORY 3: LITERATURE REVIEW ("Find papers on...", "Summarize studies...")
+* **Step 1: Check Existing Knowledge**
+    * Use `check_rag_for_topic_tool(keywords)` to see if we already have papers.
+* **Step 2: Search External (If needed)**
+    * Use `pubmed_search_and_store_tool(keywords, years, pnum)` to fetch new papers.
 * **Step 3: Synthesize**
-    * Use `search_rag_database_tool(query="...")`
+    * Use `search_rag_database_tool(query)` to answer using the stored papers and Knowledge Graph.
 
 # RESPONSE FORMATTING
-
-## For Pathway Questions:
-```
-**[Pathway Name]** (KEGG: hsa04623)
-
-**Overview:** [Description from KEGG]
-
-**Key Components:**
-- Gene1: [role]
-- Gene2: [role]
-
-**KEGG Map:** [URL from tool]
-
-*Source: KEGG Database*
-```
-
-## For Citations:
-- ONLY use PMIDs that appear in tool output
-- If no papers found: "I don't have papers on this topic in my database. Would you like me to search PubMed?"
-- Attribute to databases: "According to KEGG...", "STRING database shows...", "GTEx data indicates..."
-
-# SELF-CHECK BEFORE RESPONDING
-
-Before writing your final answer, verify:
-1. ☐ Did I call at least one tool?
-2. ☐ Does EVERY PMID I'm citing appear in a tool output?
-3. ☐ Am I attributing facts to the correct source (KEGG, STRING, GTEx, PubMed)?
-4. ☐ If I have no tool data, am I offering to search rather than guessing?
+* **Gene Function:** Start with the official summary from `gene_info_tool`.
+* **Predictions:**
+    * **Region:** Interpret signals (e.g., "High ATAC signal indicates open chromatin").
+    * **Variants:** Focus on the *difference* (e.g., "Strong decrease in CTCF binding detected").
+    * **Disclaimer:** Clearly state that AlphaGenome results are *AI predictions*, not experimental results.
+* **Citations:** Use standard format `[PMID: 12345678]`.
 
 # EXECUTION LOOP
-1. **Identify query type** → Pathway? Gene? Interaction? Literature?
-2. **Call appropriate tool(s)** → MANDATORY before answering
-3. **Read tool output** → Extract facts and any PMIDs
-4. **Synthesize answer** → Using ONLY information from tools
-5. **Self-check** → Verify no hallucinated citations
+1. **Analyze Request:** Identify biological entities (Genes, Tissues, Variants).
+2. **Select Tool:** Pick the tool from the Routing Guide above.
+3. **Observe Output:** Read the tool's raw output.
+4. **Refine/Answer:** If tool fails (e.g., "Gene not found"), try an alias. If successful, synthesize the answer.
 """
 
 tools = [
@@ -1219,22 +913,11 @@ tools = [
     get_database_stats_tool,
     verify_facts_tool,
     explore_kg_entity_tool,
-    gene_tissue_expression_tool,
     get_gene_coordinates_tool,
     gene_info_tool,
     alphagenome_predict,
     alphagenome_variant_effect,
     alphagenome_available_tracks,
-    # STRING
-    string_get_interactions,
-    string_functional_enrichment,
-    string_network_image,
-    # KEGG
-    kegg_search_pathways,
-    kegg_get_pathway,
-    kegg_find_pathways_for_gene,
-    kegg_find_pathways_for_genes,
-    kegg_disease_pathways,
 ]
 
 pubmed_agent = create_agent(

@@ -1046,16 +1046,6 @@ try:
                        
         Returns:
             Pathway details including genes and description.
-            
-        Common pathway IDs:
-            - hsa04110: Cell cycle
-            - hsa04210: Apoptosis
-            - hsa04151: PI3K-Akt signaling
-            - hsa04010: MAPK signaling
-            - hsa04310: Wnt signaling
-            - hsa04350: TGF-beta signaling
-            - hsa04150: mTOR signaling
-            - hsa05200: Pathways in cancer
         """
         client = _get_kegg()
         result = client.get_pathway(pathway_id)
