@@ -109,7 +109,7 @@ OUTPUT_TYPE_INFO = {
         description="Histone modifications (ChIP-seq)",
         units="Fold-change over control (summed per 128bp bin)",
         resolution_bp=128,
-        interpretation="Values >1 = enriched over input control. H3K4me3=promoters, H3K27ac=active enhancers, H3K27me3=repressed.",
+        interpretation="Values >1 = enriched over input control. H3K4me3=promoters, H3K27ac=active enhancers, H3K27me3=repressed. Strong peaks typically 1000-20000. Compare across regions rather than using absolute thresholds.",
         has_strand=False,
         extra_metadata=["histone_mark"],
     ),
@@ -118,7 +118,7 @@ OUTPUT_TYPE_INFO = {
         description="Transcription factor binding (ChIP-seq)",
         units="Fold-change over control (summed per 128bp bin)",
         resolution_bp=128,
-        interpretation="Values >1 = TF binding enriched. K562/HepG2 have most TFs (269/501). Other tissues mainly CTCF/POLR2A.",
+        interpretation="Values >1 = TF binding enriched. K562/HepG2 have most TFs (269/501). Other tissues mainly CTCF/POLR2A. Strong peaks typically 1000-20000. Compare across regions rather than using absolute thresholds.",
         has_strand=False,
         extra_metadata=["transcription_factor"],
     ),
@@ -751,21 +751,13 @@ class AlphaGenomeHandler:
                     log2fc = 0
                 
                 # Interpret effect
-                if abs(diff) < 0.001:
+                if abs(log2fc) < 0.1:
                     effect_label = "NEUTRAL"
-                elif diff > 0.05:
-                    effect_label = "⬆️ STRONG INCREASE"
-                elif diff > 0.01:
-                    effect_label = "↗ moderate increase"
-                elif diff < -0.05:
-                    effect_label = "⬇️ STRONG DECREASE"
-                elif diff < -0.01:
-                    effect_label = "↘ moderate decrease"
-                elif diff > 0:
-                    effect_label = "↗ slight increase"
+                elif log2fc > 0:
+                    effect_label = f"↑ INCREASED ({fold_change:.2f}x)"
                 else:
-                    effect_label = "↘ slight decrease"
-                
+                    effect_label = f"↓ DECREASED ({fold_change:.2f}x)"
+
                 result["effects"][attr_name] = {
                     "ref_mean": ref_stats["mean"],
                     "alt_mean": alt_stats["mean"],
