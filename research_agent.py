@@ -842,6 +842,85 @@ def get_gene_coordinates_tool(gene_symbol: str) -> str:
     
     return "\n".join(output)
 
+def get_promoter_region(gene_symbol: str, upstream: int = 1500, downstream: int = 500) -> str:
+    """
+    Get promoter coordinates for a gene.
+    
+    Args:
+        gene_symbol: Gene name (e.g., "TP53")
+        upstream: Base pairs upstream of TSS (default 1500)
+        downstream: Base pairs downstream of TSS (default 500)
+    
+    Returns:
+        Location string like "chr17:7687050-7689050"
+    """
+    gene_symbol = gene_symbol.strip().upper()
+    
+    try:
+        url = f"https://rest.ensembl.org/lookup/symbol/homo_sapiens/{gene_symbol}"
+        headers = {"Content-Type": "application/json"}
+        r = requests.get(url, headers=headers, timeout=15)
+        
+        if r.ok:
+            data = r.json()
+            chrom = data.get("seq_region_name")
+            start = data.get("start")
+            end = data.get("end")
+            strand = data.get("strand", 1)
+            
+            # Calculate promoter based on strand
+            if strand == 1:  # + strand, TSS is at start
+                tss = start
+                promoter_start = tss - upstream
+                promoter_end = tss + downstream
+            else:  # - strand, TSS is at end
+                tss = end
+                promoter_start = tss - downstream
+                promoter_end = tss + upstream
+            
+            return {
+                "gene": gene_symbol,
+                "tss": tss,
+                "strand": "+" if strand == 1 else "-",
+                "promoter_location": f"chr{chrom}:{promoter_start}-{promoter_end}",
+                "promoter_size": upstream + downstream,
+            }
+        else:
+            return {"error": f"Gene not found: {gene_symbol}"}
+            
+    except Exception as e:
+        return {"error": str(e)}
+
+@tool
+def get_promoter_coordinates_tool(gene_symbol: str, upstream: int = 1500, downstream: int = 500) -> str:
+    """
+    Get the PROMOTER region coordinates for a gene (NOT the whole gene).
+    
+    Use this when analyzing promoter activity, H3K4me3, CAGE signal, etc.
+    Returns ~2kb region around the transcription start site (TSS).
+    
+    Args:
+        gene_symbol: Gene name (e.g., "TP53", "EGFR")
+        upstream: Base pairs upstream of TSS (default 1500)
+        downstream: Base pairs downstream of TSS (default 500)
+    
+    Returns:
+        Promoter coordinates for use with AlphaGenome
+    """
+    result = get_promoter_region(gene_symbol, upstream, downstream)
+    
+    if "error" in result:
+        return f"Error: {result['error']}"
+    
+    return (
+        f"**Promoter Region for {result['gene']}**\n"
+        f"  TSS position: {result['tss']:,}\n"
+        f"  Strand: {result['strand']}\n"
+        f"  Promoter: {result['promoter_location']}\n"
+        f"  Size: {result['promoter_size']} bp\n\n"
+        f"Use this location for AlphaGenome: {result['promoter_location']}"
+    )
+
 # ============================================
 # AGENT SETUP
 # ============================================
@@ -866,7 +945,8 @@ system_prompt = """You are an advanced Biomedical Research Agent. Your goal is t
 
 ## CATEGORY 2: PREDICTIONS & NON-CODING ("Analyze the promoter...", "Variant effect...")
 * **Step 1: Coordinates**
-    * Get coordinates using `get_gene_coordinates_tool` first.
+    * Get gene coordinates using `get_gene_coordinates_tool` first.
+    * Get promoter coordinates using 'get_promoter_coordinates_tool' 
 * **Step 2: Check Availability (Optional)**
     * If asked about specific TFs or Histone marks (e.g., "Does CTCF bind here?"), verify coverage first.
     * Use `alphagenome_available_tracks(output_type="tf", tissue="...")`
@@ -914,6 +994,7 @@ tools = [
     verify_facts_tool,
     explore_kg_entity_tool,
     get_gene_coordinates_tool,
+    get_promoter_coordinates_tool,
     gene_info_tool,
     alphagenome_predict,
     alphagenome_variant_effect,
