@@ -379,7 +379,7 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
                 output.append(f"{'Tissue':<35} {'Median TPM':>12} {'n':>5}")
                 output.append(f"{'-'*35} {'-'*12} {'-'*5}")
                 
-                for exp in filtered_exp[:10]:  # Show top 10 matches
+                for exp in filtered_exp:  # Show top 10 matches
                     tissue_name = exp.get("tissueSiteDetailId", "Unknown")[:34]
                     median = exp.get("median", 0)
                     n_samples = exp.get("nSamples", "N/A")
@@ -390,9 +390,6 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
                         f"{str(n_samples):>5}"
                     )
                 
-                if len(filtered_exp) > 10:
-                    output.append(f"\n... and {len(filtered_exp) - 10} more tissue subtypes")
-                    
             else:
                 output.append(f"⚠️  No tissues matching '{tissue}' found.")
                 output.append(f"   Available tissues include:")

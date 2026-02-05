@@ -163,14 +163,17 @@ OUTPUT_TYPE_INFO = {
 # ============================================================================
 
 TISSUE_ONTOLOGY_MAP = {
-    # Common tissues (UBERON)
-    "lung": "UBERON:0002048",
-    "liver": "UBERON:0002107",
-    "brain": "UBERON:0000955",
+    "Adipose - Subcutaneous": "UBERON:0002190",
+    "Adipose - Visceral (Omentum)": "UBERON:0010414",
+    "Adrenal Gland": "UBERON:0002369",
+    "Artery - Aorta": "UBERON:0001496",
+    "Artery - Coronary": "UBERON:0001621",
+    "Artery - Tibial": "UBERON:0007610",
+    "Bladder": "UBERON:0001255",
     "Brain - Amygdala": "UBERON:0001876",
     "Brain - Anterior cingulate cortex (BA24)": "UBERON:0009835",
     "Brain - Caudate (basal ganglia)": "UBERON:0001873",
-    "Brain - Cerebellar Hemisphere": "UBERON:0002037",
+    "Brain - Cerebellar Hemisphere": "UBERON:0002245",
     "Brain - Cerebellum": "UBERON:0002037",
     "Brain - Cortex": "UBERON:0001870",
     "Brain - Frontal Cortex (BA9)": "UBERON:0009834",
@@ -180,44 +183,42 @@ TISSUE_ONTOLOGY_MAP = {
     "Brain - Putamen (basal ganglia)": "UBERON:0001874",
     "Brain - Spinal cord (cervical c-1)": "UBERON:0006469",
     "Brain - Substantia nigra": "UBERON:0002038",
-    "heart": "UBERON:0000948",
-    "kidney": "UBERON:0002113",
-    "skin": "UBERON:0002097",
-    "muscle": "UBERON:0001134",
-    "colon": "UBERON:0001155",
-    "colon_sigmoid": "UBERON:0001159",
-    "colon_transverse": "UBERON:0001157",
-    "stomach": "UBERON:0000945",
-    "pancreas": "UBERON:0001264",
-    "spleen": "UBERON:0002106",
-    "thyroid": "UBERON:0002046",
-    "adrenal": "UBERON:0002369",
-    "breast": "UBERON:0000310",
-    "prostate": "UBERON:0002367",
-    "ovary": "UBERON:0000992",
-    "testis": "UBERON:0000473",
-    "blood": "UBERON:0000178",
-    "bone_marrow": "UBERON:0002371",
-    
-    # Cell lines (EFO) - These have BEST coverage for ChIP-TF!
-    "k562": "EFO:0002067",      # 269 TFs
-    "hepg2": "EFO:0001187",     # 501 TFs  
-    "hct116": "EFO:0002824",    # Colon carcinoma
-    "gm12878": "EFO:0002784",   # Lymphoblastoid
-    "a549": "EFO:0001086",      # Lung carcinoma
-    "mcf7": "EFO:0001203",      # Breast cancer
-    "imr90": "EFO:0001196",     # Fibroblast
-    
-    # Cell types (CL)
-    "hepatocyte": "CL:0000182",
-    "neuron": "CL:0000540",
-    "t_cell": "CL:0000084",
-    "b_cell": "CL:0000236",
-    "macrophage": "CL:0000235",
-    "fibroblast": "CL:0000057",
-    "epithelial": "CL:0000066",
-    "endothelial": "CL:0000115",
-    "cd34_positive": "CL:0001059",  # HSC progenitor
+    "Breast - Mammary Tissue": "UBERON:0008367",
+    "Cells - Cultured fibroblasts": "EFO:0002009",
+    "Cells - EBV-transformed lymphocytes": "EFO:0000572",
+    "Cervix - Ectocervix": "UBERON:0012249",
+    "Cervix - Endocervix": "UBERON:0000458",
+    "Colon - Sigmoid": "UBERON:0001159",
+    "Colon - Transverse": "UBERON:0001157",
+    "Esophagus - Gastroesophageal Junction": "UBERON:0004550",
+    "Esophagus - Mucosa": "UBERON:0006920",
+    "Esophagus - Muscularis": "UBERON:0004648",
+    "Fallopian Tube": "UBERON:0003889",
+    "Heart - Atrial Appendage": "UBERON:0006631",
+    "Heart - Left Ventricle": "UBERON:0006566",
+    "Kidney - Cortex": "UBERON:0001225",
+    "Kidney - Medulla": "UBERON:0001293",
+    "Liver": "UBERON:0001114",
+    "Lung": "UBERON:0008952",
+    "Minor Salivary Gland": "UBERON:0006330",
+    "Muscle - Skeletal": "UBERON:0011907",
+    "Nerve - Tibial": "UBERON:0001323",
+    "Ovary": "UBERON:0000992",
+    "Pancreas": "UBERON:0001150",
+    "Pituitary": "UBERON:0000007",
+    "Prostate": "UBERON:0002367",
+    "Skin - Not Sun Exposed (Suprapubic)": "UBERON:0036149",
+    "Skin - Sun Exposed (Lower leg)": "UBERON:0004264",
+    "Small Intestine - Terminal Ileum": "UBERON:0001211",
+    "Spleen": "UBERON:0002106",
+    "Stomach": "UBERON:0000945",
+    "Testis": "UBERON:0000473",
+    "Thyroid": "UBERON:0002046",
+    "Uterus": "UBERON:0000995",
+    "Vagina": "UBERON:0000996",
+    "Whole Blood": "UBERON:0013756",
+    "K562 (Myeloid Leukemia)": "EFO:0002067",
+    "HepG2 (Liver Carcinoma)": "EFO:0001187",
 }
 
 # Reverse mapping for display
