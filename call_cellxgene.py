@@ -39,7 +39,6 @@ class GeneExpressionResult:
 class SingleCellQueryTool:
     """
     Tool for querying single-cell gene expression data from CELLxGENE Census.
-    Optimized for AI agent integration with fast, structured responses.
     """
     
     def __init__(self, census_version: Optional[str] = "2025-11-08"):

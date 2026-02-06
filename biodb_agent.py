@@ -64,11 +64,6 @@ pi_llm = ChatOllama(model="ministral-3:8b")
 @tool
 def gene_info_tool(gene_symbol: str) -> str:
     """
-    Get authoritative information about a gene from NCBI and UniProt.
-    
-    ALWAYS use this tool FIRST before answering questions about a gene's
-    function, expression, or role in disease. This prevents hallucination.
-    
     Args:
         gene_symbol: Gene symbol (e.g., "EGFR", "TP53", "EGFLAM")
     
@@ -232,16 +227,6 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
     """
     Query gene expression from GTEx (bulk RNA-seq across human tissues).
     
-    This tool provides tissue-level expression data from the Genotype-Tissue 
-    Expression (GTEx) project. It measures average expression across all cells
-    in a tissue sample (bulk RNA-seq), which is complementary to single-cell data.
-    
-    Use this when:
-    - You need tissue-level expression quantification (TPM values)
-    - Comparing expression across different tissues
-    - Checking if a gene is broadly expressed in a tissue
-    - GTEx data is the gold standard for tissue transcriptomics
-    
     Args:
         gene_symbol: Gene name (e.g., "TERT", "EGFR", "TP53") or Ensembl ID
         tissue: Optional tissue filter (e.g., "Lung", "Brain", "Liver", "Heart")
@@ -251,11 +236,6 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
         - Median expression across tissue samples
         - Rank of tissues by expression level
         - Sample size (number of donors)
-    
-    Example queries:
-        - "TERT expression across all tissues"
-        - "EGFR levels in brain vs lung"
-        - "Which tissues express TP53 highest?"
     
     Note: GTEx measures bulk tissue averages. 
     """
@@ -458,8 +438,6 @@ def sc_expression_query_tool(
 ) -> str:
     """
     Query single-cell gene expression data from the CELLxGENE Census.
-    Useful for questions like: "What is the expression of ACE2 in lung tissue?",
-    "Show gene expression in T cells for COVID-19 patients."
     
     Args:
         organism: "Homo sapiens" or "Mus musculus" (default: Homo sapiens)
@@ -494,7 +472,6 @@ def sc_find_markers_tool(
 ) -> str:
     """
     Identify marker genes that distinguish a specific cell type in a tissue.
-    Useful for: "What genes are unique to B cells in the blood?", "Find markers for macrophages."
     
     Args:
         cell_type: The target cell type (e.g., "B cell")

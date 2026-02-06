@@ -24,11 +24,7 @@ logger = logging.getLogger(__name__)
 class STRINGClient:
     """
     Client for STRING database API.
-    
     STRING: Search Tool for the Retrieval of Interacting Genes/Proteins
-    https://string-db.org/
-    
-    API Documentation: https://string-db.org/help/api/
     """
     
     BASE_URL = "https://string-db.org/api"
@@ -330,10 +326,6 @@ class STRINGClient:
 class KEGGClient:
     """
     Client for KEGG (Kyoto Encyclopedia of Genes and Genomes) API.
-    
-    https://www.kegg.jp/
-    
-    API Documentation: https://www.kegg.jp/kegg/rest/keggapi.html
     """
     
     BASE_URL = "https://rest.kegg.jp"
@@ -949,9 +941,6 @@ try:
         """
         Get protein-protein interactions from STRING database.
         
-        STRING contains known and predicted protein interactions from multiple
-        evidence sources: experiments, databases, text mining, co-expression, etc.
-        
         Args:
             proteins: Comma-separated protein/gene names (e.g., "TP53,MDM2,CDKN1A")
             species: Species name (human, mouse, rat, zebrafish, fly, worm, yeast)
@@ -963,9 +952,6 @@ try:
         
         Returns:
             Interaction network with scores and evidence types.
-            
-        Example:
-            string_get_interactions(proteins="TP53,MDM2,CDKN1A", min_score=700)
         """
         client = _get_string()
         protein_list = [p.strip() for p in proteins.split(",") if p.strip()]
@@ -1072,16 +1058,6 @@ try:
                        
         Returns:
             Pathway details including genes and description.
-            
-        Common pathway IDs:
-            - hsa04110: Cell cycle
-            - hsa04210: Apoptosis
-            - hsa04151: PI3K-Akt signaling
-            - hsa04010: MAPK signaling
-            - hsa04310: Wnt signaling
-            - hsa04350: TGF-beta signaling
-            - hsa04150: mTOR signaling
-            - hsa05200: Pathways in cancer
         """
         client = _get_kegg()
         result = client.get_pathway(pathway_id)
@@ -1117,18 +1093,12 @@ try:
         """
         Find KEGG pathways enriched for a set of genes.
         
-        Useful for understanding what biological processes a gene list is involved in.
-        Returns pathways sorted by number of input genes they contain.
-        
         Args:
             genes: Comma-separated gene symbols (e.g., "TP53,BRCA1,ATM,CHEK2")
             organism: Organism name
             
         Returns:
             Pathways ranked by gene overlap.
-            
-        Example:
-            kegg_find_pathways_for_genes(genes="TP53,MDM2,CDKN1A,BAX,BCL2")
         """
         client = _get_kegg()
         gene_list = [g.strip() for g in genes.split(",") if g.strip()]
@@ -1148,9 +1118,6 @@ try:
                     
         Returns:
             Disease-related pathways.
-            
-        Example:
-            kegg_disease_pathways(disease="lung cancer")
         """
         client = _get_kegg()
         result = client.get_disease_pathways(disease)
