@@ -33,6 +33,7 @@ from pathway_tools import (
     kegg_find_pathways_for_genes,
     kegg_disease_pathways,
 )
+from call_cellxgene import SingleCellQueryTool
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -446,73 +447,71 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
     except Exception as e:
         output.append(f"❌ Error querying GTEx: {str(e)[:100]}")
         return "\n".join(output)
-    
-# =========================================
-# GENE COORDINATES TOOL
-# =========================================
 
 @tool
-def get_gene_coordinates_tool(gene_symbol: str) -> str:
+def sc_expression_query_tool(
+    organism: str = "Homo sapiens",
+    tissue: str = None,
+    cell_type: str = None,
+    disease: str = None,
+    genes: str = None
+) -> str:
     """
-    Get genomic coordinates for a gene (useful for regulatory/TE queries).
+    Query single-cell gene expression data from the CELLxGENE Census.
+    Useful for questions like: "What is the expression of ACE2 in lung tissue?",
+    "Show gene expression in T cells for COVID-19 patients."
     
     Args:
-        gene_symbol: Gene name (e.g., "TP53", "EGFR")
-    
-    Returns:
-        Chromosome, start, end coordinates (GRCh38) with DATA SOURCE STATUS
+        organism: "Homo sapiens" or "Mus musculus" (default: Homo sapiens)
+        tissue: Tissue name (e.g., "lung", "blood", "brain")
+        cell_type: Specific cell type (e.g., "T cell", "macrophage")
+        disease: Disease state (e.g., "COVID-19", "normal", "pulmonary fibrosis")
+        genes: Comma-separated list of gene symbols (e.g., "ACE2,TMPRSS2")
     """
-    # Normalize gene symbol
-    gene_symbol = gene_symbol.strip().upper()
-    
-    output = []
-    sources_status = {"Ensembl REST API": "❌ NOT QUERIED"}
-    
     try:
-        url = f"https://rest.ensembl.org/lookup/symbol/homo_sapiens/{gene_symbol}"
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-        }
+        # Convert comma-separated string to list
+        gene_list = [g.strip() for g in genes.split(",")] if genes else None
         
-        r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-        
-        if r.ok:
-            data = r.json()
-            chrom = data.get("seq_region_name", "Unknown")
-            start = data.get("start", 0)
-            end = data.get("end", 0)
-            strand = "+" if data.get("strand", 1) == 1 else "-"
-            
-            sources_status["Ensembl REST API"] = "✅ SUCCESS"
-            
-            output.append(f"**{gene_symbol}** coordinates (GRCh38):")
-            output.append(f"  Chromosome: {chrom}")
-            output.append(f"  Start: {start}")
-            output.append(f"  End: {end}")       
-            output.append(f"  Strand: {strand}")
-            output.append(f"  Ensembl ID: {data.get('id', 'N/A')}")
-        elif r.status_code == 404:
-            sources_status["Ensembl REST API"] = "⚠️ GENE NOT FOUND"
-            output.append(f"Gene '{gene_symbol}' not found in Ensembl")
-        else:
-            sources_status["Ensembl REST API"] = f"❌ HTTP {r.status_code}"
-            output.append(f"Ensembl API error: HTTP {r.status_code}")
-            
-    except requests.exceptions.Timeout:
-        sources_status["Ensembl REST API"] = "❌ TIMEOUT"
-        output.append("Ensembl API timeout")
+        # Use the tool with a context manager to ensure connection closes
+        with SingleCellQueryTool() as sc_tool:
+            result = sc_tool.query_expression(
+                organism=organism,
+                tissue=tissue,
+                cell_type=cell_type,
+                disease=disease,
+                genes=gene_list,
+                max_cells=10000 # Limit to prevent timeouts
+            )
+            return json.dumps(result.to_dict(), indent=2)
     except Exception as e:
-        sources_status["Ensembl REST API"] = f"❌ ERROR"
-        output.append(f"Error: {str(e)}")
+        return f"Error querying Single-Cell Census: {str(e)}"
+
+@tool
+def sc_find_markers_tool(
+    cell_type: str,
+    tissue: str,
+    organism: str = "Homo sapiens"
+) -> str:
+    """
+    Identify marker genes that distinguish a specific cell type in a tissue.
+    Useful for: "What genes are unique to B cells in the blood?", "Find markers for macrophages."
     
-    # DATA SOURCE STATUS
-    output.append("\n" + "="*50)
-    output.append("**DATA SOURCE STATUS:**")
-    for source, status in sources_status.items():
-        output.append(f"  • {source}: {status}")
-    
-    return "\n".join(output)
+    Args:
+        cell_type: The target cell type (e.g., "B cell")
+        tissue: The tissue to search in (e.g., "blood")
+        organism: "Homo sapiens" or "Mus musculus"
+    """
+    try:
+        with SingleCellQueryTool() as sc_tool:
+            markers = sc_tool.find_marker_genes(
+                organism=organism,
+                cell_type=cell_type,
+                tissue=tissue,
+                top_n=10
+            )
+            return json.dumps(markers, indent=2)
+    except Exception as e:
+        return f"Error finding markers: {str(e)}"
 
 # ============================================
 # AGENT SETUP
@@ -525,22 +524,30 @@ system_prompt = """You are an advanced Biomedical Research Agent. Your goal is t
 # CRITICAL OPERATING RULES
 1. **NO HALLUCINATION:** Never guess gene functions, expression levels, or paper citations/links. If a tool returns no data, state "No data found."
 2. **VERIFY FIRST:** You must verify a gene's identity (using `gene_info_tool`) before discussing its function or expression.
-3. **CITE SOURCES:** Only cite PMIDs or data sources (e.g., "GTEx v10") that explicitly appear in tool outputs.
+3. **CITE SOURCES:** Only cite PMIDs or data sources (e.g., "GTEx v10", "CELLxGENE Census") that explicitly appear in tool outputs.
 
 # TOOL ROUTING GUIDE (How to choose the right tool)
 
-## CATEGORY 1: GENE QUESTIONS ("What is GENE?", "Where is GENE expressed?")
-* **Step 1: Identity (MANDATORY)**
+## CATEGORY 1: GENE & CELL QUESTIONS ("What is GENE?", "Expression in T-cells?")
+* **Step 1: Identity (MANDATORY for Gene questions)**
     * Use `gene_info_tool(gene_symbol)`
     * *Goal:* Get the official symbol, summary, and aliases.
-* **Step 2: Expression (If asked about tissues/cells)**
-    * **Context: "Overall / Bulk tissue"** (e.g., "Is EGFR in the lung?")
+
+* **Step 2: Expression & Cell Type Analysis (Choose Context)**
+    * **Context A: "Overall / Bulk Tissue"** (e.g., "Is EGFR expressed in the lung?")
         * Use `gene_tissue_expression_tool(gene_symbol, tissue)`
         * *Source:* GTEx (Bulk RNA-seq). Measures average expression in whole tissue samples.
-* **Step 3: Coordinates (If asked about location)**
-    * Use `get_gene_coordinates_tool(gene_symbol)`
+    
+    * **Context B: "Single Cell / Specific Cell Types"** (e.g., "Is ACE2 expressed in Alveolar Macrophages?", "Compare T-cells vs B-cells")
+        * Use `sc_expression_query_tool(genes, cell_type, tissue, disease)`
+        * *Source:* CELLxGENE Census (scRNA-seq). Measures expression in individual cells.
+        * *Note:* Use specific filters (e.g., `tissue="lung"`, `disease="COVID-19"`) if provided.
 
-## CATEGORY 2: PROTEIN INTERACTIONS ("What interacts with GENE?"), 
+    * **Context C: "Cell Markers / Identity"** (e.g., "What genes distinguish Microglia?", "Find markers for B-cells")
+        * Use `sc_find_markers_tool(cell_type, tissue)`
+        * *Goal:* Identify genes that uniquely define a specific cell population.
+
+## CATEGORY 2: PROTEIN INTERACTIONS ("What interacts with GENE?")
 * **Protein-Protein Interactions (STRING)**
     * **Single protein:** "What interacts with TP53?"
         * Use `string_get_interactions(proteins="TP53", min_score=700)`
@@ -572,7 +579,8 @@ system_prompt = """You are an advanced Biomedical Research Agent. Your goal is t
 # RESPONSE FORMATTING
 * **Gene Function:** Start with the official summary from `gene_info_tool`.
 * **Expression Data:**
-    * Report the units (TPM for bulk).
+    * **Bulk (GTEx):** Report the units (TPM).
+    * **Single Cell:** Report the **% of cells expressing** the gene and the **mean expression** level.
 * **Interactions (STRING):**
     * Report confidence level (high/medium/low based on score).
     * Mention evidence types if relevant (experimental, database, text-mining).
@@ -581,7 +589,7 @@ system_prompt = """You are an advanced Biomedical Research Agent. Your goal is t
     * Include KEGG URLs when helpful for the user.
 
 # EXECUTION LOOP
-1. **Analyze Request:** Identify biological entities (Genes, Tissues etc).
+1. **Analyze Request:** Identify biological entities (Genes, Tissues, Cell Types).
 2. **Select Tool:** Pick the tool from the Routing Guide above.
 3. **Observe Output:** Read the tool's raw output.
 4. **Refine/Answer:** If tool fails (e.g., "Gene not found"), try an alias. If successful, synthesize the answer.
@@ -589,8 +597,9 @@ system_prompt = """You are an advanced Biomedical Research Agent. Your goal is t
 
 tools = [
     gene_tissue_expression_tool,
-    get_gene_coordinates_tool,
     gene_info_tool,
+    sc_find_markers_tool,
+    sc_expression_query_tool,
     # STRING
     string_get_interactions,
     string_functional_enrichment,
