@@ -41,6 +41,7 @@ import aiohttp
 from collections import defaultdict
 from rank_bm25 import BM25Okapi
 from pathlib import Path
+from pydantic import BaseModel, Field
 import logging
 import requests
 import numpy as np
@@ -56,11 +57,7 @@ except ImportError:
 
 # Import knowledge graph module
 from knowledge_graph import KnowledgeGraphManager
-from alphagenome_tool import (
-    alphagenome_predict,
-    alphagenome_variant_effect,
-    alphagenome_available_tracks,
-)
+from alphagenome_tool import AlphaGenomePredictor
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -921,6 +918,45 @@ def get_promoter_coordinates_tool(gene_symbol: str, upstream: int = 1500, downst
         f"Use this location for AlphaGenome: {result['promoter_location']}"
     )
 
+class GenomicPredictionInput(BaseModel):
+    coordinates: str = Field(
+        description="Genomic coordinates in 'chr:start-end' format (e.g., 'chr17:7676000-7677000')."
+    )
+    tissue: str = Field(
+        description="Target tissue or cell type name (e.g., 'lung', 'liver', 'T-cell')."
+    )
+    assays: List[str] = Field(
+        default=["atac"],
+        description="List of assays to predict. Valid options: ['atac', 'dnase', 'rna', 'cage', 'chip_histone', 'chip_tf']."
+    )
+
+# 2. Define the Tool
+# We use a global instance to avoid re-initializing the heavyweight client on every call
+PREDICTOR = AlphaGenomePredictor(skip_validation=False)
+
+@tool(args_schema=GenomicPredictionInput)
+def predict_genomics(coordinates: str, tissue: str, assays: List[str] = ["atac"]) -> str:
+    """
+    Predicts functional genomic signals (ATAC-seq, RNA-seq, etc.) for a specific 
+    coordinate range and tissue type using AlphaGenome.
+    """
+    try:
+        # Call the existing logic from your script
+        result = PREDICTOR.predict_coordinates(
+            coordinates=coordinates,
+            tissue=tissue,
+            assays=assays,
+            sequence_length="auto"
+        )
+        
+        # Format the output into a string the LLM can read
+        # (Using the format_results helper from your script)
+        from alphagenome_tool import format_results
+        return format_results(result)
+        
+    except Exception as e:
+        return f"Error running AlphaGenome prediction: {str(e)}"
+
 # ============================================
 # AGENT SETUP
 # ============================================
@@ -943,25 +979,29 @@ system_prompt = """You are an advanced Biomedical Research Agent. Your goal is t
 * **Step 3: Coordinates (If asked about location)**
     * Use `get_gene_coordinates_tool(gene_symbol)`
 
-## CATEGORY 2: PREDICTIONS & NON-CODING ("Analyze the promoter...", "Variant effect...")
-* **Step 1: Coordinates**
-    * Get gene coordinates using `get_gene_coordinates_tool` first.
-    * Get promoter coordinates using 'get_promoter_coordinates_tool' 
-* **Step 2: Check Availability (Optional)**
-    * If asked about specific TFs or Histone marks (e.g., "Does CTCF bind here?"), verify coverage first.
-    * Use `alphagenome_available_tracks(output_type="tf", tissue="...")`
-* **Step 3: Select Prediction Type**
-    * **A. General Region Analysis** ("Analyze the promoter of TP53")
-        * Use `alphagenome_predict(location, tissue, assays, ...)`
-        * **Assays:**
-            * `atac,dnase` (Chromatin Accessibility)
-            * `rna,cage` (Gene Expression & TSS)
-            * `histone,tf` (Epigenetics - Use `filter_tf="CTCF"` to narrow down)
-            * `splice,contacts` (Splicing & 3D Structure)
-        * *Tip:* Use `compare_tissues="liver,brain"` if the user asks for comparisons.
-    * **B. Variant/Mutation Analysis** ("What is the effect of A>G at chr1:100?", "Score rs12345")
-        * Use `alphagenome_variant_effect(location, ref_allele, alt_allele, ...)`
-        * *Goal:* Predict how a specific mutation changes epigenomic signals (REF vs ALT).
+## CATEGORY 2: PREDICTIONS & NON-CODING ("Analyze the promoter...", "Check accessibility...")
+* **Step 1: Formulate the Tool Call**
+    * **Tool:** Use `predict_genomics` for all coordinate-based queries.
+    * **Coordinates:** strict `chr:start-end` format (e.g., "chr17:7676000-7677000").
+    * **Tissue:** Use the **common biological name** (e.g., "Lung", "HepG2", "T-cell").
+        * *Do NOT* guess ontology IDs (like UBERON:0002048). The tool will resolve names automatically.
+        * *If the tool returns an "Ambiguous Tissue" error:* It will provide a list of valid options. Retry the call using one of the exact suggested names.
+
+* **Step 2: Select Assays**
+    * Map the user's request to these supported assay IDs:
+        * **Accessibility:** `["atac", "dnase"]`
+        * **Expression:** `["rna", "cage", "procap"]`
+        * **Regulation:** `["chip_tf", "chip_histone"]` (includes CTCF, H3K27ac, etc.)
+        * **Structure:** `["contacts", "splice"]` (Hi-C, splicing)
+    * *Default:* If unspecified, use `["atac", "rna"]`.
+
+* **Step 3: Handling Complex Queries**
+    * **Comparisons:** ("Compare liver and brain...")
+        * The tool only accepts *one* tissue per call.
+        * You must generate **two separate tool calls** (one for "liver", one for "brain") and compare the numerical outputs in your final answer.
+    * **Specific Factors:** ("Does CTCF bind here?")
+        * Request `assays=["chip_tf"]`. The tool will return the aggregate TF signal.
+        * *Note:* You cannot filter for specific TFs (like CTCF) in the input. Request the broad assay and interpret the signal intensity as general binding potential.
 
 ## CATEGORY 3: LITERATURE REVIEW ("Find papers on...", "Summarize studies...")
 * **Step 1: Check Existing Knowledge**
@@ -974,10 +1014,7 @@ system_prompt = """You are an advanced Biomedical Research Agent. Your goal is t
 # RESPONSE FORMATTING
 * **Gene Function:** Start with the official summary from `gene_info_tool`.
 * **Predictions:**
-    * **Id mathing:** Always match tissue names to their ids, do not pass tissue names in the tools' parameters.
-    * **Assay Alias matching:** Always match an assay alias from a query to its official output type name (eg expression : RNA_SEQ) and pass the official output type name as a parameter, not the alias.
-    * **Region:** Interpret signals (e.g., "High ATAC signal indicates open chromatin").
-    * **Variants:** Focus on the *difference* (e.g., "Strong decrease in CTCF binding detected").
+    * **Region:** Report signal values based on the tool output and interpret them (e.g., "High ATAC signal indicates open chromatin").
     * **Disclaimer:** Clearly state that AlphaGenome results are *AI predictions*, not experimental results.
 * **Citations:** Use standard format `[PMID: 12345678]`.
 
@@ -998,9 +1035,7 @@ tools = [
     get_gene_coordinates_tool,
     get_promoter_coordinates_tool,
     gene_info_tool,
-    alphagenome_predict,
-    alphagenome_variant_effect,
-    alphagenome_available_tracks,
+    predict_genomics
 ]
 
 pubmed_agent = create_agent(

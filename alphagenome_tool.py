@@ -1,249 +1,73 @@
 """
-AlphaGenome Tool v3 - Complete Implementation Using Official API
-================================================================
+AlphaGenome Coordinate-Based Prediction Tool
+=============================================
 
-This implementation uses the proper AlphaGenome API patterns:
-1. Uses `predict_interval()` with `genome.Interval` (not manual sequence fetching)
-2. Properly handles multi-track outputs with metadata
-3. Includes ALL 11 output types with correct units/interpretation
-4. Uses official variant scoring patterns
-5. Handles TF-specific and histone-specific tracks correctly
+Simplified interface for making AlphaGenome predictions using genomic coordinate ranges.
+Optimized for batch processing multiple regions for a given tissue and assay.
 
-Output Types Supported:
-- ATAC, DNASE: Chromatin accessibility (normalized insertion signal, 1bp)
-- RNA_SEQ, CAGE, PROCAP: Gene expression (normalized read signal, 1bp)
-- CHIP_HISTONE: Histone modifications (fold-change over control, 128bp)
-- CHIP_TF: Transcription factor binding (fold-change over control, 128bp)
-- SPLICE_SITES: Splice site probability (0-1, 1bp)
-- SPLICE_SITE_USAGE: Fraction of transcripts using site (0-1, 1bp)
-- SPLICE_JUNCTIONS: Junction read counts (normalized, 1bp)
-- CONTACT_MAPS: 3D chromatin contacts (log-fold over distance, 2048bp)
+Features:
+- Single or multiple coordinate range input
+- Automatic validation of tissue/assay combinations against live API metadata
+- Coordinate parsing from strings or BED files
+- Batch processing with progress tracking
 """
 
 import numpy as np
+import pandas as pd
 import logging
-from typing import Optional, List, Dict, Any, Union
+from typing import List, Dict, Any, Optional, Union, Set, Tuple
 from dataclasses import dataclass
+from pathlib import Path
 import os
+from tqdm import tqdm
+
 from dotenv import load_dotenv
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Try to import AlphaGenome
 try:
     from alphagenome.data import genome
     from alphagenome.models import dna_client
-    from alphagenome.models import variant_scorers
     ALPHAGENOME_AVAILABLE = True
 except ImportError:
     ALPHAGENOME_AVAILABLE = False
     logger.warning("AlphaGenome not installed. Install with: pip install alphagenome")
-    # Create dummy classes for type hints
-    genome = None
-    dna_client = None
-    variant_scorers = None
 
 
 # ============================================================================
-# OUTPUT TYPE METADATA
+# CONFIGURATION
 # ============================================================================
 
-@dataclass
-class OutputTypeInfo:
-    """Metadata about each AlphaGenome output type."""
-    name: str
-    description: str
-    units: str
-    resolution_bp: int
-    interpretation: str
-    has_strand: bool = False
-    has_tissue: bool = True
-    extra_metadata: Optional[List[str]] = None  # e.g., ['transcription_factor', 'histone_mark']
-
-
-OUTPUT_TYPE_INFO = {
-    "ATAC": OutputTypeInfo(
-        name="ATAC",
-        description="Chromatin accessibility (ATAC-seq)",
-        units="Normalized insertion signal (100M insertions)",
-        resolution_bp=1,
-        interpretation="Higher values = more accessible/open chromatin. Compare across regions or tissues.",
-        has_strand=False,
-    ),
-    "DNASE": OutputTypeInfo(
-        name="DNASE", 
-        description="Chromatin accessibility (DNase-seq)",
-        units="Normalized insertion signal (100M insertions)",
-        resolution_bp=1,
-        interpretation="Higher values = more accessible/open chromatin. DNase often more sensitive than ATAC.",
-        has_strand=False,
-    ),
-    "RNA_SEQ": OutputTypeInfo(
-        name="RNA_SEQ",
-        description="Gene expression (RNA-seq)",
-        units="Normalized read signal (RPM-like, 100M reads)",
-        resolution_bp=1,
-        interpretation="Higher values = more transcription. Stranded tracks show direction.",
-        has_strand=True,
-        extra_metadata=["gtex_tissue"],
-    ),
-    "CAGE": OutputTypeInfo(
-        name="CAGE",
-        description="Transcription start site activity (CAGE-seq)",
-        units="Normalized read signal",
-        resolution_bp=1,
-        interpretation="Peaks indicate active transcription start sites. High near promoters.",
-        has_strand=True,
-    ),
-    "PROCAP": OutputTypeInfo(
-        name="PROCAP",
-        description="Nascent transcription (PRO-cap)",
-        units="Normalized read signal",
-        resolution_bp=1,
-        interpretation="Captures active RNA polymerase. More precise TSS than CAGE.",
-        has_strand=True,
-    ),
-    "CHIP_HISTONE": OutputTypeInfo(
-        name="CHIP_HISTONE",
-        description="Histone modifications (ChIP-seq)",
-        units="Fold-change over control (summed per 128bp bin)",
-        resolution_bp=128,
-        interpretation="Values >1 = enriched over input control. H3K4me3=promoters, H3K27ac=active enhancers, H3K27me3=repressed. Strong peaks typically 1000-20000. Compare across regions rather than using absolute thresholds.",
-        has_strand=False,
-        extra_metadata=["histone_mark"],
-    ),
-    "CHIP_TF": OutputTypeInfo(
-        name="CHIP_TF",
-        description="Transcription factor binding (ChIP-seq)",
-        units="Fold-change over control (summed per 128bp bin)",
-        resolution_bp=128,
-        interpretation="Values >1 = TF binding enriched. K562/HepG2 have most TFs (269/501). Other tissues mainly CTCF/POLR2A. Strong peaks typically 1000-20000. Compare across regions rather than using absolute thresholds.",
-        has_strand=False,
-        extra_metadata=["transcription_factor"],
-    ),
-    "SPLICE_SITES": OutputTypeInfo(
-        name="SPLICE_SITES",
-        description="Splice site probability",
-        units="Probability (0-1)",
-        resolution_bp=1,
-        interpretation="Higher = more likely to be a splice site. Separate tracks for donor/acceptor and +/- strand.",
-        has_strand=True,
-        has_tissue=False,  # Tissue-agnostic!
-    ),
-    "SPLICE_SITE_USAGE": OutputTypeInfo(
-        name="SPLICE_SITE_USAGE",
-        description="Fraction of transcripts using splice site",
-        units="Fraction (0-1)",
-        resolution_bp=1,
-        interpretation="What fraction of spanning reads use this splice site. 1.0 = constitutive, <1 = alternative.",
-        has_strand=True,
-    ),
-    "SPLICE_JUNCTIONS": OutputTypeInfo(
-        name="SPLICE_JUNCTIONS",
-        description="Splice junction read counts",
-        units="Normalized junction signal",
-        resolution_bp=1,
-        interpretation="Predicted split-read counts spanning introns. Higher = more splicing events.",
-        has_strand=True,
-    ),
-    "CONTACT_MAPS": OutputTypeInfo(
-        name="CONTACT_MAPS",
-        description="3D chromatin contacts (Hi-C/Micro-C)",
-        units="Log-fold over genomic distance expectation",
-        resolution_bp=2048,
-        interpretation="Positive = more contact than expected for that distance. Detects TADs, loops, compartments.",
-        has_strand=False,
-    ),
+SUPPORTED_LENGTHS = {
+    "2KB": 2048,
+    "16KB": 16384,
+    "100KB": 131072,
+    "500KB": 524288,
+    "1MB": 1048576,
 }
 
-
-# ============================================================================
-# TISSUE/ONTOLOGY MAPPING
-# ============================================================================
-
-TISSUE_ONTOLOGY_MAP = {
-    "Adipose - Subcutaneous": "UBERON:0002190",
-    "Adipose - Visceral (Omentum)": "UBERON:0010414",
-    "Adrenal Gland": "UBERON:0002369",
-    "Artery - Aorta": "UBERON:0001496",
-    "Artery - Coronary": "UBERON:0001621",
-    "Artery - Tibial": "UBERON:0007610",
-    "Bladder": "UBERON:0001255",
-    "Brain - Amygdala": "UBERON:0001876",
-    "Brain - Anterior cingulate cortex (BA24)": "UBERON:0009835",
-    "Brain - Caudate (basal ganglia)": "UBERON:0001873",
-    "Brain - Cerebellar Hemisphere": "UBERON:0002245",
-    "Brain - Cerebellum": "UBERON:0002037",
-    "Brain - Cortex": "UBERON:0001870",
-    "Brain - Frontal Cortex (BA9)": "UBERON:0009834",
-    "Brain - Hippocampus": "UBERON:0001954",
-    "Brain - Hypothalamus": "UBERON:0001898",
-    "Brain - Nucleus accumbens (basal ganglia)": "UBERON:0001882",
-    "Brain - Putamen (basal ganglia)": "UBERON:0001874",
-    "Brain - Spinal cord (cervical c-1)": "UBERON:0006469",
-    "Brain - Substantia nigra": "UBERON:0002038",
-    "Breast - Mammary Tissue": "UBERON:0008367",
-    "Cells - Cultured fibroblasts": "EFO:0002009",
-    "Cells - EBV-transformed lymphocytes": "EFO:0000572",
-    "Cervix - Ectocervix": "UBERON:0012249",
-    "Cervix - Endocervix": "UBERON:0000458",
-    "Colon - Sigmoid": "UBERON:0001159",
-    "Colon - Transverse": "UBERON:0001157",
-    "Esophagus - Gastroesophageal Junction": "UBERON:0004550",
-    "Esophagus - Mucosa": "UBERON:0006920",
-    "Esophagus - Muscularis": "UBERON:0004648",
-    "Fallopian Tube": "UBERON:0003889",
-    "Heart - Atrial Appendage": "UBERON:0006631",
-    "Heart - Left Ventricle": "UBERON:0006566",
-    "Kidney - Cortex": "UBERON:0001225",
-    "Kidney - Medulla": "UBERON:0001293",
-    "Liver": "UBERON:0001114",
-    "Lung": "UBERON:0008952",
-    "Minor Salivary Gland": "UBERON:0006330",
-    "Muscle - Skeletal": "UBERON:0011907",
-    "Nerve - Tibial": "UBERON:0001323",
-    "Ovary": "UBERON:0000992",
-    "Pancreas": "UBERON:0001150",
-    "Pituitary": "UBERON:0000007",
-    "Prostate": "UBERON:0002367",
-    "Skin - Not Sun Exposed (Suprapubic)": "UBERON:0036149",
-    "Skin - Sun Exposed (Lower leg)": "UBERON:0004264",
-    "Small Intestine - Terminal Ileum": "UBERON:0001211",
-    "Spleen": "UBERON:0002106",
-    "Stomach": "UBERON:0000945",
-    "Testis": "UBERON:0000473",
-    "Thyroid": "UBERON:0002046",
-    "Uterus": "UBERON:0000995",
-    "Vagina": "UBERON:0000996",
-    "Whole Blood": "UBERON:0013756",
-    "K562 (Myeloid Leukemia)": "EFO:0002067",
-    "HepG2 (Liver Carcinoma)": "EFO:0001187",
-}
-
-# Reverse mapping for display
-ONTOLOGY_TO_NAME = {v: k for k, v in TISSUE_ONTOLOGY_MAP.items()}
-
-
-# ============================================================================
-# ASSAY NAME MAPPING  
-# ============================================================================
+SUPPORTED_LENGTHS_LIST = [2048, 16384, 131072, 524288, 1048576]
 
 ASSAY_ALIASES = {
-    # Short names -> Official OutputType names
     "atac": "ATAC",
     "accessibility": "ATAC",
     "dnase": "DNASE",
+    "dna_accessibility": "DNASE",
     "rna": "RNA_SEQ",
     "rna_seq": "RNA_SEQ",
     "expression": "RNA_SEQ",
     "cage": "CAGE",
     "tss": "CAGE",
     "procap": "PROCAP",
+    "transcription_initiation": "PROCAP",
     "histone": "CHIP_HISTONE",
     "chip_histone": "CHIP_HISTONE",
     "h3k4me3": "CHIP_HISTONE",
     "h3k27ac": "CHIP_HISTONE",
+    "h3k27me3": "CHIP_HISTONE",
     "tf": "CHIP_TF",
     "chip_tf": "CHIP_TF",
     "transcription_factor": "CHIP_TF",
@@ -262,930 +86,611 @@ ASSAY_ALIASES = {
 }
 
 
-# ============================================================================
-# MAIN HANDLER CLASS
-# ============================================================================
-
-class AlphaGenomeHandler:
-    """
-    Handler for Google DeepMind's AlphaGenome API.
+@dataclass
+class CoordinateRange:
+    """Represents a genomic coordinate range (0-based, half-open)."""
+    chrom: str
+    start: int
+    end: int
+    name: Optional[str] = None
     
-    Uses the official API patterns:
-    - predict_interval() with genome.Interval objects
-    - Proper coordinate tracking via interval.resize()
-    - Full track metadata access
-    - Built-in variant scoring
-    """
+    def __post_init__(self):
+        if not self.chrom.startswith('chr'):
+            self.chrom = f"chr{self.chrom}"
+        if self.start < 0:
+            raise ValueError(f"Start position must be >= 0, got {self.start}")
+        if self.end <= self.start:
+            raise ValueError(f"End must be > start, got {self.end} <= {self.start}")
     
-    # Valid sequence lengths
-    SEQUENCE_LENGTHS = {
-        "2KB": 2048,
-        "16KB": 16384,
-        "100KB": 102400,
-        "500KB": 524288,
-        "1MB": 1048576,
-    }
+    @property
+    def width(self) -> int:
+        return self.end - self.start
     
-    def __init__(self, api_key: Optional[str] = None):
-        """Initialize with API key (or from ALPHAGENOME_API_KEY env var)."""
-        self.api_key = api_key or os.getenv("ALPHAGENOME_API_KEY", "")
-        self.client = None
-        self.output_metadata = None
-        
-        if not ALPHAGENOME_AVAILABLE:
-            logger.error("AlphaGenome library not installed")
-            return
-            
-        if not self.api_key:
-            logger.warning("No API key provided. Set ALPHAGENOME_API_KEY environment variable.")
-            return
-            
-        try:
-            self.client = dna_client.create(self.api_key)
-            # Cache output metadata for track info
-            self.output_metadata = self.client.output_metadata(
-                organism=dna_client.Organism.HOMO_SAPIENS
-            )
-            logger.info("AlphaGenome client initialized successfully")
-        except Exception as e:
-            logger.error(f"Failed to initialize AlphaGenome client: {e}")
-    
-    def _resolve_tissue(self, tissue: str) -> str:
-        """Convert tissue name to ontology ID."""
-        tissue_lower = tissue.lower().replace(" ", "_").replace("-", "_")
-        
-        # Check if already an ontology ID
-        if ":" in tissue:
-            return tissue
-            
-        # Look up in map
-        if tissue_lower in TISSUE_ONTOLOGY_MAP:
-            return TISSUE_ONTOLOGY_MAP[tissue_lower]
-        
-        # Try partial match
-        for key, value in TISSUE_ONTOLOGY_MAP.items():
-            if tissue_lower in key or key in tissue_lower:
-                return value
-                
-        raise ValueError(
-            f"Unknown tissue: {tissue}. "
-            f"Available: {', '.join(sorted(TISSUE_ONTOLOGY_MAP.keys()))}"
+    def to_interval(self) -> Any:
+        return genome.Interval(
+            chromosome=self.chrom,
+            start=self.start,
+            end=self.end
         )
     
-    def _resolve_assays(self, assays: List[str]) -> List[Any]:
+    def __str__(self) -> str:
+        name_str = f" ({self.name})" if self.name else ""
+        return f"{self.chrom}:{self.start:,}-{self.end:,}{name_str}"
+    
+    @classmethod
+    def from_string(cls, coord_str: str, name: Optional[str] = None) -> "CoordinateRange":
+        clean = coord_str.replace(" ", "").replace(",", "")
+        if ":" not in clean:
+            raise ValueError(f"Invalid format: {coord_str}. Expected 'chr:start-end'")
+        chrom, rest = clean.split(":", 1)
+        if "-" not in rest:
+            pos = int(rest)
+            return cls(chrom, pos, pos + 1, name)
+        start_str, end_str = rest.split("-", 1)
+        return cls(chrom, int(start_str), int(end_str), name)
+    
+    @classmethod
+    def from_bed_line(cls, line: str) -> "CoordinateRange":
+        parts = line.strip().split("\t")
+        chrom = parts[0]
+        start = int(parts[1])
+        end = int(parts[2])
+        name = parts[3] if len(parts) > 3 else None
+        return cls(chrom, start, end, name)
+
+
+# ============================================================================
+# ONTOLOGY VALIDATOR
+# ============================================================================
+
+class OntologyValidator:
+    """Validates tissue/assay combinations against live API metadata."""
+    
+    def __init__(self, client: Any):
+        self.client = client
+        self._metadata_cache = {}
+        self._ontology_cache = {}
+    
+    def get_available_ontologies(self, assay_type: str) -> Set[str]:
+        """
+        Fetch available ontology CURIEs for a given assay type from API metadata.
+        
+        Args:
+            assay_type: Official assay type name (e.g., 'ATAC', 'CHIP_TF')
+            
+        Returns:
+            Set of available ontology CURIE strings
+        """
+        # Check cache first
+        if assay_type in self._ontology_cache:
+            return self._ontology_cache[assay_type]
+        
+        # Fetch metadata from API
+        try:
+            metadata = self.client.output_metadata(organism=dna_client.Organism.HOMO_SAPIENS)
+            self._metadata_cache['full'] = metadata
+        except Exception as e:
+            logger.error(f"Failed to fetch metadata: {e}")
+            return set()
+        
+        # Extract ontology_curie column for the specific assay
+        assay_key = assay_type.lower()
+        if not hasattr(metadata, assay_key):
+            logger.warning(f"Metadata not found for assay: {assay_type}")
+            return set()
+        
+        assay_metadata = getattr(metadata, assay_key)
+        
+        # Extract unique ontology_curie values
+        if 'ontology_curie' in assay_metadata.columns:
+            ontologies = set(assay_metadata['ontology_curie'].dropna().unique())
+        elif 'ontology_id' in assay_metadata.columns:
+            ontologies = set(assay_metadata['ontology_id'].dropna().unique())
+        else:
+            # Fallback: look for any column containing 'ontology'
+            ontology_cols = [c for c in assay_metadata.columns if 'ontology' in c.lower()]
+            if ontology_cols:
+                ontologies = set(assay_metadata[ontology_cols[0]].dropna().unique())
+            else:
+                ontologies = set()
+                logger.warning(f"No ontology column found in metadata for {assay_type}")
+        
+        self._ontology_cache[assay_type] = ontologies
+        logger.info(f"Found {len(ontologies)} valid ontologies for {assay_type}")
+        return ontologies
+    
+    def get_biosample_summary(self, assay_type: str) -> pd.DataFrame:
+        """Get summary of available biosamples for an assay type."""
+        metadata = self.client.output_metadata(organism=dna_client.Organism.HOMO_SAPIENS)
+        assay_key = assay_type.lower()
+        
+        if not hasattr(metadata, assay_key):
+            return pd.DataFrame()
+        
+        assay_metadata = getattr(metadata, assay_key)
+        
+        # Summarize by biosample/ontology
+        summary_cols = ['biosample_name', 'ontology_curie', 'ontology_name']
+        available_cols = [c for c in summary_cols if c in assay_metadata.columns]
+        
+        if available_cols:
+            return assay_metadata[available_cols].drop_duplicates().sort_values(by=available_cols[0])
+        return assay_metadata.head()
+    
+    def validate_ontology(self, ontology_id: str, assay_type: str) -> Tuple[bool, str]:
+        """
+        Validate if an ontology ID is available for a specific assay.
+        
+        Args:
+            ontology_id: Ontology CURIE (e.g., 'UBERON:0002048') or name
+            assay_type: Assay type to check against
+            
+        Returns:
+            (is_valid, message) tuple
+        """
+        available = self.get_available_ontologies(assay_type)
+        
+        if not available:
+            return False, f"No metadata available for assay {assay_type}"
+        
+        # Direct match
+        if ontology_id in available:
+            return True, f"Valid: {ontology_id} is available for {assay_type}"
+        
+        # Try to resolve if it's a name rather than CURIE
+        metadata = self._metadata_cache.get('full')
+        assay_key = assay_type.lower()
+        
+        if metadata and hasattr(metadata, assay_key):
+            assay_meta = getattr(metadata, assay_key)
+            
+            # Search in ontology_name or biosample_name columns
+            name_cols = [c for c in assay_meta.columns if 'name' in c.lower()]
+            for col in name_cols:
+                matches = assay_meta[assay_meta[col].str.lower() == ontology_id.lower()]
+                if not matches.empty:
+                    correct_curie = matches.iloc[0].get('ontology_curie', ontology_id)
+                    return False, f"Invalid CURIE format. Did you mean: {correct_curie} ({ontology_id})?"
+        
+        # Suggest similar ontologies
+        suggestions = [o for o in available if ontology_id.split(':')[0] in o]
+        if suggestions:
+            return False, f"Invalid ontology: {ontology_id}. Similar available: {suggestions[:5]}"
+        
+        return False, f"Invalid ontology: {ontology_id}. Not found in {len(available)} available ontologies for {assay_type}"
+    
+    def find_ontology_by_name(self, name: str, assay_type: str) -> Optional[str]:
+        """Find ontology CURIE by biosample/ontology name."""
+        metadata = self.client.output_metadata(organism=dna_client.Organism.HOMO_SAPIENS)
+        assay_key = assay_type.lower()
+        
+        if not hasattr(metadata, assay_key):
+            return None
+        
+        assay_meta = getattr(metadata, assay_key)
+        name_lower = name.lower()
+        
+        # Search across relevant columns
+        search_cols = [c for c in assay_meta.columns if any(x in c.lower() for x in ['name', 'biosample', 'tissue'])]
+        
+        for col in search_cols:
+            matches = assay_meta[assay_meta[col].str.lower().str.contains(name_lower, na=False)]
+            if not matches.empty:
+                return matches.iloc[0].get('ontology_curie', matches.iloc[0].get('ontology_id'))
+        
+        return None
+
+
+# ============================================================================
+# MAIN PREDICTION CLASS
+# ============================================================================
+
+class AlphaGenomePredictor:
+    """Streamlined AlphaGenome predictor with ontology validation."""
+    
+    def __init__(self, api_key: Optional[str] = None, skip_validation: bool = False):
+        """
+        Initialize predictor.
+        
+        Args:
+            api_key: AlphaGenome API key (or set ALPHAGENOME_API_KEY env var)
+            skip_validation: Skip ontology validation (faster but less safe)
+        """
+        if not ALPHAGENOME_AVAILABLE:
+            raise ImportError("AlphaGenome not installed. Run: pip install alphagenome")
+        
+        self.api_key = api_key or os.getenv("ALPHAGENOME_API_KEY")
+        if not self.api_key:
+            raise ValueError("API key required. Set ALPHAGENOME_API_KEY or pass to constructor.")
+        
+        self.client = dna_client.create(self.api_key)
+        self.skip_validation = skip_validation
+        self.validator = OntologyValidator(self.client) if not skip_validation else None
+        
+        logger.info("AlphaGenome client initialized")
+    
+    def _resolve_ontology(self, tissue: str, assay_types: List[str]) -> str:
+        """
+        Convert tissue name to ontology ID and validate against assays.
+        
+        Args:
+            tissue: Tissue name or ontology CURIE
+            assay_types: List of assay types to validate against
+            
+        Returns:
+            Validated ontology CURIE string
+            
+        Raises:
+            ValueError: If tissue cannot be resolved or validated
+        """
+        # If already a CURIE, validate it
+        if ':' in tissue:
+            ontology_id = tissue
+        else:
+            # Try to find by name for each assay type
+            found_curie = None
+            for assay in assay_types:
+                found_curie = self.validator.find_ontology_by_name(tissue, assay)
+                if found_curie:
+                    break
+            
+            if found_curie:
+                ontology_id = found_curie
+                logger.info(f"Resolved '{tissue}' to '{ontology_id}'")
+            else:
+                ontology_id = tissue  # Pass through, will fail validation
+        
+        # Validate against all requested assays
+        if not self.skip_validation and self.validator:
+            validation_errors = []
+            for assay in assay_types:
+                is_valid, msg = self.validator.validate_ontology(ontology_id, assay)
+                if not is_valid:
+                    validation_errors.append(f"{assay}: {msg}")
+            
+            if validation_errors:
+                error_msg = f"Ontology validation failed for '{ontology_id}':\n" + "\n".join(validation_errors)
+                
+                # Try to provide helpful suggestions
+                suggestions = []
+                for assay in assay_types:
+                    available = self.validator.get_available_ontologies(assay)
+                    # Find partial matches
+                    for ont in available:
+                        if tissue.lower() in ont.lower() or any(part in ont.lower() for part in tissue.lower().split()):
+                            suggestions.append((assay, ont))
+                
+                if suggestions:
+                    error_msg += f"\n\nDid you mean one of these?\n"
+                    for assay, ont in suggestions[:10]:
+                        error_msg += f"  - {ont} (for {assay})\n"
+                
+                raise ValueError(error_msg)
+        
+        return ontology_id
+    
+    def _resolve_assays(self, assays: List[str]) -> set:
         """Convert assay names to OutputType enums."""
-        output_types = []
+        output_types = set()
+        
         for assay in assays:
             assay_lower = assay.lower().strip()
-            
-            # Map alias to official name
             official_name = ASSAY_ALIASES.get(assay_lower, assay.upper())
             
-            # Get the enum
             if hasattr(dna_client.OutputType, official_name):
-                output_types.append(getattr(dna_client.OutputType, official_name))
+                output_types.add(getattr(dna_client.OutputType, official_name))
             else:
-                logger.warning(f"Unknown assay type: {assay}")
-                
+                logger.warning(f"Unknown assay: {assay}")
+        
+        if not output_types:
+            raise ValueError(f"No valid assays. Available: {list(ASSAY_ALIASES.keys())}")
+        
         return output_types
     
-    def _parse_location(self, location: str) -> tuple:
-        """Parse location string to (chrom, start, end)."""
-        # Remove commas and spaces
-        clean = location.replace(",", "").replace(" ", "").strip()
-        
-        if ":" not in clean:
-            raise ValueError(f"Invalid location format: {location}. Use 'chr:start-end'")
-        
-        chrom, rest = clean.split(":", 1)
-        
-        if "-" in rest:
-            start_str, end_str = rest.split("-", 1)
-            start = int(start_str)
-            end = int(end_str)
-        else:
-            # Single position
-            pos = int(rest)
-            start = pos
-            end = pos + 1
-            
-        return chrom, start, end
+    def _get_best_sequence_length(self, query_width: int) -> int:
+        """Select best sequence length for query."""
+        min_required = int(query_width * 2)
+        for length in SUPPORTED_LENGTHS_LIST:
+            if length >= min_required:
+                return length
+        return max(SUPPORTED_LENGTHS_LIST)
     
-    def _extract_region_stats(
-        self, 
-        values: np.ndarray,
-        query_interval: Any,
-        output_interval: Any,
-        resolution: int = 1
-    ) -> Dict[str, float]:
+    def get_available_assays(self) -> Dict[str, List[str]]:
+        """Get list of available assays and their valid ontologies."""
+        if not self.validator:
+            return {}
+        
+        assays = ['ATAC', 'DNASE', 'RNA_SEQ', 'CAGE', 'PROCAP', 
+                  'CHIP_HISTONE', 'CHIP_TF', 'SPLICE_SITES', 
+                  'SPLICE_SITE_USAGE', 'SPLICE_JUNCTIONS', 'CONTACT_MAPS']
+        
+        result = {}
+        for assay in assays:
+            try:
+                ontologies = self.validator.get_available_ontologies(assay)
+                result[assay] = sorted(list(ontologies))[:20]  # Limit output
+            except Exception as e:
+                result[assay] = [f"Error: {str(e)}"]
+        
+        return result
+    
+    def predict_coordinates(
+        self,
+        coordinates: Union[CoordinateRange, str, List[Union[CoordinateRange, str]]],
+        tissue: str,
+        assays: List[str] = None,
+        sequence_length: Optional[Union[str, int]] = None,
+        aggregate_by: Optional[str] = "mean",
+        validate: bool = True
+    ) -> Dict[str, Any]:
         """
-        Extract statistics for query region from output values.
+        Predict functional signals for one or more coordinate ranges.
         
         Args:
-            values: Track values array (seq_len, n_tracks) or (seq_len,)
-            query_interval: The original query interval
-            output_interval: The interval the output covers
-            resolution: Output resolution in bp
-            
+            coordinates: Single coordinate or list (strings or CoordinateRange objects)
+            tissue: Tissue name or ontology CURIE
+            assays: List of assays to predict (default: ["atac"])
+            sequence_length: "auto", specific size, or None for auto
+            aggregate_by: Aggregation method ("mean", "max", "sum", None)
+            validate: Whether to validate ontology against assay metadata
+        
         Returns:
-            Dict with mean, max, min, std, n_bins
+            Dictionary with predictions or validation errors
         """
-        # Calculate query region indices within output
-        query_start_in_output = query_interval.start - output_interval.start
-        query_end_in_output = query_interval.end - output_interval.start
+        # Normalize inputs
+        if isinstance(coordinates, (str, CoordinateRange)):
+            coordinates = [coordinates]
         
-        # Convert to bin indices
-        start_bin = max(0, query_start_in_output // resolution)
-        end_bin = min(len(values), query_end_in_output // resolution)
+        coord_ranges = []
+        for c in coordinates:
+            if isinstance(c, str):
+                coord_ranges.append(CoordinateRange.from_string(c))
+            else:
+                coord_ranges.append(c)
         
-        if start_bin >= end_bin:
-            end_bin = min(len(values), start_bin + 1)
+        # Resolve assays first (needed for ontology validation)
+        if assays is None:
+            assays = ["atac"]
+        output_types = self._resolve_assays(assays)
+        assay_names = [ot.name for ot in output_types]
         
-        # Handle multi-track arrays
-        if values.ndim == 2:
-            slice_data = values[start_bin:end_bin, :]
-            # Average across tracks if multiple
-            slice_data = np.nanmean(slice_data, axis=1)
-        else:
-            slice_data = values[start_bin:end_bin]
+        # Resolve and validate ontology
+        try:
+            ontology_id = self._resolve_ontology(tissue, assay_names)
+        except ValueError as e:
+            return {
+                "error": str(e),
+                "tissue": tissue,
+                "assays": assays,
+                "coordinates": [str(c) for c in coord_ranges],
+                "validation_failed": True
+            }
         
-        # Remove NaNs
-        slice_data = slice_data[~np.isnan(slice_data)]
-        
-        if len(slice_data) == 0:
-            return {"mean": 0.0, "max": 0.0, "min": 0.0, "std": 0.0, "n_bins": 0}
+        # Process predictions
+        results = []
+        for coord in tqdm(coord_ranges, desc="Predicting regions"):
+            try:
+                result = self._predict_single_range(
+                    coord, ontology_id, output_types, sequence_length, aggregate_by
+                )
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Failed to predict {coord}: {e}")
+                results.append({
+                    "coordinates": str(coord),
+                    "error": str(e)
+                })
         
         return {
-            "mean": float(np.mean(slice_data)),
-            "max": float(np.max(slice_data)),
-            "min": float(np.min(slice_data)),
-            "std": float(np.std(slice_data)),
-            "n_bins": len(slice_data),
+            "tissue": tissue,
+            "ontology_id": ontology_id,
+            "assays": assays,
+            "validation_skipped": self.skip_validation,
+            "results": results
         }
     
-    def predict_region(
-        self,
-        location: str,
-        tissue: str = "lung",
-        assays: Optional[List[str]] = None,
-        sequence_length: str = "1MB",
-        filter_strand: Optional[str] = None,
-        filter_tf: Optional[str] = None,
-        filter_histone: Optional[str] = None,
-        compare_tissues: Optional[List[str]] = None,
-        top_tracks: int = 10,
-    ) -> Dict[str, Any]:
-        """
-        Predict functional signals for a genomic region.
-        
-        Args:
-            location: Genomic coordinates "chr:start-end" (GRCh38)
-            tissue: Tissue/cell type name or ontology ID
-            assays: List of assay types (default: ["atac", "dnase", "rna"])
-            sequence_length: Context window size ("2KB", "16KB", "100KB", "500KB", "1MB")
-            filter_strand: Filter to specific strand ("+", "-", or None for both)
-            filter_tf: Filter ChIP-TF to specific transcription factor
-            filter_histone: Filter ChIP-Histone to specific mark (e.g., "H3K4me3")
-            compare_tissues: Additional tissues to compare against
-            top_tracks: For multi-track outputs, show top N by signal
+    def _predict_single_range(
+            self,
+            coord: CoordinateRange,
+            ontology_id: str,
+            output_types: set,
+            sequence_length: Optional[Union[str, int]],
+            aggregate_by: Optional[str]
+        ) -> Dict[str, Any]:
+            """Predict for a single coordinate range."""
             
-        Returns:
-            Dict with predictions, metadata, and interpretation guidance
-        """
-        if not self.client:
-            return {"error": "AlphaGenome client not initialized. Check API key."}
-        
-        # Parse location
-        try:
-            chrom, start, end = self._parse_location(location)
-        except ValueError as e:
-            return {"error": str(e)}
-        
-        # Create query interval
-        query_interval = genome.Interval(chromosome=chrom, start=start, end=end)
-        
-        # Get sequence length
-        seq_len = self.SEQUENCE_LENGTHS.get(sequence_length.upper(), 1048576)
-        
-        # Resize to valid input length (centered on query)
-        input_interval = query_interval.resize(seq_len)
-        
-        # Resolve tissue
-        try:
-            ontology_id = self._resolve_tissue(tissue)
-        except ValueError as e:
-            return {"error": str(e)}
-        
-        # Default assays
-        if not assays:
-            assays = ["atac", "dnase", "rna"]
-        if isinstance(assays, str):
-            assays = [a.strip() for a in assays.split(",")]
-        
-        # Resolve assay types
-        output_types = self._resolve_assays(assays)
-        if not output_types:
-            return {"error": f"No valid assay types. Available: {list(ASSAY_ALIASES.keys())}"}
-        
-        # Build result
-        result = {
-            "query": {
-                "location": f"{chrom}:{start:,}-{end:,}",
-                "size_bp": end - start,
-                "tissue": tissue,
-                "ontology_id": ontology_id,
-                "assays": [ot.name for ot in output_types],
-                "context_window": sequence_length,
-            },
-            "predictions": {},
-            "interpretation": {},
-            "metadata": {},
-        }
-        
-        try:
-            # Make prediction
+            # 1. Determine Sequence Length
+            if sequence_length is None or sequence_length == "auto":
+                seq_len = self._get_best_sequence_length(coord.width)
+            elif isinstance(sequence_length, str):
+                seq_len = SUPPORTED_LENGTHS.get(sequence_length.upper(), 1048576)
+            else:
+                seq_len = sequence_length
+
+            # 2. Resize Interval (Official Pattern)
+            # The SDK requires the query to be resized to a supported model input length
+            query_interval = coord.to_interval()
+            input_interval = query_interval.resize(seq_len)
+            
+            # 3. Call API
             output = self.client.predict_interval(
                 interval=input_interval,
-                requested_outputs=set(output_types),
+                requested_outputs=output_types,
                 ontology_terms=[ontology_id],
             )
             
-            # Process each output type
+            assay_results = {}
+            
             for output_type in output_types:
-                attr_name = output_type.name.lower()
-                type_info = OUTPUT_TYPE_INFO.get(output_type.name, None)
-                
-                if not hasattr(output, attr_name):
-                    result["predictions"][attr_name] = {"error": "Not available for this tissue"}
+                type_name = output_type.name.lower()
+                if not hasattr(output, type_name):
                     continue
                 
-                track_data = getattr(output, attr_name)
-                values = track_data.values  # Shape: (seq_len, n_tracks)
-                metadata = track_data.metadata
+                track_data_obj = getattr(output, type_name)
                 
-                # Apply filters
-                track_mask = np.ones(len(metadata), dtype=bool)
-                
-                if filter_strand and "strand" in metadata.columns:
-                    track_mask &= (metadata["strand"] == filter_strand).values
-                
-                if filter_tf and "transcription_factor" in metadata.columns:
-                    track_mask &= metadata["transcription_factor"].str.contains(
-                        filter_tf, case=False, na=False
-                    ).values
-                
-                if filter_histone and "histone_mark" in metadata.columns:
-                    track_mask &= metadata["histone_mark"].str.contains(
-                        filter_histone, case=False, na=False
-                    ).values
-                
-                # Filter values and metadata
-                filtered_values = values[:, track_mask]
-                filtered_metadata = metadata[track_mask]
-                
-                if filtered_values.shape[1] == 0:
-                    result["predictions"][attr_name] = {"error": "No tracks match filters"}
-                    continue
-                
-                # Get resolution
-                resolution = type_info.resolution_bp if type_info else 1
-                
-                # Calculate statistics for query region
-                stats = self._extract_region_stats(
-                    filtered_values,
-                    query_interval,
-                    track_data.interval,
-                    resolution
-                )
-                
-                # Per-track statistics for top tracks
-                track_stats = []
-                max_signals = filtered_values.max(axis=0)
-                top_indices = np.argsort(max_signals)[-top_tracks:][::-1]
-                
-                for idx in top_indices:
-                    track_meta = filtered_metadata.iloc[idx].to_dict()
-                    track_values = filtered_values[:, idx]
-                    track_stat = self._extract_region_stats(
-                        track_values,
-                        query_interval,
-                        track_data.interval,
-                        resolution
+                # --- REFINED SECTION: Use SDK Helper instead of manual math ---
+                try:
+                    # This handles resolution (1bp vs 128bp) and stranding automatically
+                    # match_resolution=True ensures we don't crash on 128bp tracks
+                    sliced_track = track_data_obj.slice_by_interval(
+                        query_interval, 
+                        match_resolution=True
                     )
-                    track_stats.append({
-                        "metadata": {k: v for k, v in track_meta.items() 
-                                    if k in ["name", "biosample_name", "strand", 
-                                            "transcription_factor", "histone_mark"]},
-                        "stats": track_stat,
-                    })
-                
-                result["predictions"][attr_name] = {
-                    "aggregate": stats,
-                    "n_tracks": filtered_values.shape[1],
-                    "top_tracks": track_stats,
-                    "units": type_info.units if type_info else "unknown",
+                    query_values = sliced_track.values
+                    resolution = getattr(track_data_obj, 'resolution', 1) # Just for reporting
+                    
+                except Exception as e:
+                    # Fallback if slice_by_interval fails or API changes
+                    logger.warning(f"Slicing failed for {type_name}, using raw window: {e}")
+                    query_values = track_data_obj.values
+                    resolution = getattr(track_data_obj, 'resolution', 1)
+
+                if query_values.size > 0:
+                    real_mean = float(np.nanmean(query_values))
+                    real_max = float(np.nanmax(query_values))
+                else:
+                    real_mean = 0.0
+                    real_max = 0.0
+
+                # 5. Handle Aggregation (if output needs to be reduced)
+                if aggregate_by and query_values.ndim >= 1 and query_values.size > 0:
+                    if aggregate_by == "mean":
+                        aggregated = np.nanmean(query_values, axis=0)
+                    elif aggregate_by == "max":
+                        aggregated = np.nanmax(query_values, axis=0)
+                    elif aggregate_by == "sum":
+                        aggregated = np.nansum(query_values, axis=0)
+                    else:
+                        aggregated = query_values
+                else:
+                    aggregated = query_values
+
+                assay_results[type_name] = {
+                    "shape": query_values.shape,
                     "resolution_bp": resolution,
+                    # FIX: Use the 'aggregated' var only for the main signal report
+                    "aggregate_signal": float(np.nanmean(aggregated)) if np.any(~np.isnan(aggregated)) else 0.0,
+                    # FIX: Use 'real_max' derived from raw data for the max peak
+                    "max_signal": real_max, 
                 }
-                
-                # Add interpretation
-                if type_info:
-                    result["interpretation"][attr_name] = type_info.interpretation
-            
-            # Compare tissues if requested
-            if compare_tissues:
-                result["tissue_comparison"] = {}
-                for comp_tissue in compare_tissues:
-                    if comp_tissue.lower() == tissue.lower():
-                        continue
+           
+            return {
+                "coordinates": str(coord),
+                "input_interval": f"{input_interval.chromosome}:{input_interval.start:,}-{input_interval.end:,}",
+                "sequence_length": seq_len,
+                "assays": assay_results
+            }
+   
+    def predict_from_bed(
+        self,
+        bed_file: Union[str, Path],
+        tissue: str,
+        assays: List[str] = None,
+        sequence_length: Optional[str] = None,
+        aggregate_by: str = "mean",
+        limit: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Predict for all regions in a BED file."""
+        bed_path = Path(bed_file)
+        if not bed_path.exists():
+            raise FileNotFoundError(f"BED file not found: {bed_file}")
+        
+        coordinates = []
+        with open(bed_path) as f:
+            for i, line in enumerate(f):
+                if limit and i >= limit:
+                    break
+                if line.strip() and not line.startswith("#"):
                     try:
-                        comp_ontology = self._resolve_tissue(comp_tissue)
-                        comp_output = self.client.predict_interval(
-                            interval=input_interval,
-                            requested_outputs=set(output_types),
-                            ontology_terms=[comp_ontology],
-                        )
-                        
-                        comp_results = {}
-                        for output_type in output_types:
-                            attr_name = output_type.name.lower()
-                            if hasattr(comp_output, attr_name):
-                                track_data = getattr(comp_output, attr_name)
-                                type_info = OUTPUT_TYPE_INFO.get(output_type.name)
-                                resolution = type_info.resolution_bp if type_info else 1
-                                stats = self._extract_region_stats(
-                                    track_data.values,
-                                    query_interval,
-                                    track_data.interval,
-                                    resolution
-                                )
-                                comp_results[attr_name] = stats
-                        
-                        result["tissue_comparison"][comp_tissue] = comp_results
-                        
+                        coord = CoordinateRange.from_bed_line(line)
+                        coordinates.append(coord)
                     except Exception as e:
-                        result["tissue_comparison"][comp_tissue] = {"error": str(e)}
-            
-        except Exception as e:
-            result["error"] = f"Prediction failed: {str(e)}"
-            logger.exception("AlphaGenome prediction error")
+                        logger.warning(f"Skipping line {i+1}: {e}")
         
-        return result
-    
-    def predict_variant(
-        self,
-        location: str,
-        ref_allele: str,
-        alt_allele: str,
-        tissue: str = "lung",
-        assays: Optional[List[str]] = None,
-        sequence_length: str = "1MB",
-    ) -> Dict[str, Any]:
-        """
-        Predict the effect of a genetic variant.
+        logger.info(f"Loaded {len(coordinates)} regions from {bed_file}")
         
-        Uses the official AlphaGenome variant prediction API which:
-        - Compares predictions between REF and ALT sequences
-        - Handles indels correctly with proper alignment
-        - Returns both raw scores and quantile scores
-        
-        Args:
-            location: Variant position "chr:position" (1-based, GRCh38)
-            ref_allele: Reference allele (e.g., "A", "ACGT")
-            alt_allele: Alternate allele
-            tissue: Tissue/cell type
-            assays: Assay types to evaluate
-            sequence_length: Context window size
-            
-        Returns:
-            Dict with REF/ALT predictions, differences, and interpretation
-        """
-        if not self.client:
-            return {"error": "AlphaGenome client not initialized"}
-        
-        # Parse position
-        try:
-            chrom, start, end = self._parse_location(location)
-            position = start  # For single position
-        except ValueError as e:
-            return {"error": str(e)}
-        
-        # Validate alleles
-        ref_allele = ref_allele.upper().strip()
-        alt_allele = alt_allele.upper().strip()
-        valid_bases = set("ACGTN")
-        
-        if not all(b in valid_bases for b in ref_allele):
-            return {"error": f"Invalid reference allele: {ref_allele}"}
-        if not all(b in valid_bases for b in alt_allele):
-            return {"error": f"Invalid alternate allele: {alt_allele}"}
-        
-        # Create variant object (note: position is 1-based in Variant!)
-        variant = genome.Variant(
-            chromosome=chrom,
-            position=position,
-            reference_bases=ref_allele,
-            alternate_bases=alt_allele,
-        )
-        
-        # Create interval centered on variant
-        seq_len = self.SEQUENCE_LENGTHS.get(sequence_length.upper(), 1048576)
-        interval = variant.reference_interval.resize(seq_len)
-        
-        # Resolve tissue
-        try:
-            ontology_id = self._resolve_tissue(tissue)
-        except ValueError as e:
-            return {"error": str(e)}
-        
-        # Default assays for variant effect
-        if not assays:
-            assays = ["atac", "dnase", "rna", "cage"]
-        if isinstance(assays, str):
-            assays = [a.strip() for a in assays.split(",")]
-        
-        output_types = self._resolve_assays(assays)
-        if not output_types:
-            return {"error": "No valid assay types"}
-        
-        result = {
-            "variant": {
-                "location": f"{chrom}:{position}",
-                "ref": ref_allele,
-                "alt": alt_allele,
-                "tissue": tissue,
-            },
-            "effects": {},
-            "interpretation": [],
-        }
-        
-        try:
-            # Use official predict_variant API
-            output = self.client.predict_variant(
-                interval=interval,
-                variant=variant,
-                requested_outputs=set(output_types),
-                ontology_terms=[ontology_id],
-            )
-            
-            # Compare REF and ALT predictions at variant position
-            # Region of interest: ±500bp around variant
-            var_interval = genome.Interval(
-                chromosome=chrom,
-                start=max(0, position - 500),
-                end=position + 500
-            )
-            
-            for output_type in output_types:
-                attr_name = output_type.name.lower()
-                type_info = OUTPUT_TYPE_INFO.get(output_type.name)
-                resolution = type_info.resolution_bp if type_info else 1
-                
-                ref_data = getattr(output.reference, attr_name, None)
-                alt_data = getattr(output.alternate, attr_name, None)
-                
-                if ref_data is None or alt_data is None:
-                    result["effects"][attr_name] = {"error": "Not available"}
-                    continue
-                
-                # Extract stats for both
-                ref_stats = self._extract_region_stats(
-                    ref_data.values, var_interval, ref_data.interval, resolution
-                )
-                alt_stats = self._extract_region_stats(
-                    alt_data.values, var_interval, alt_data.interval, resolution
-                )
-                
-                # Calculate differences
-                diff = alt_stats["mean"] - ref_stats["mean"]
-                if ref_stats["mean"] > 1e-6:
-                    fold_change = alt_stats["mean"] / ref_stats["mean"]
-                    log2fc = np.log2(fold_change) if fold_change > 0 else 0
-                else:
-                    fold_change = float("inf") if alt_stats["mean"] > 1e-6 else 1.0
-                    log2fc = 0
-                
-                # Interpret effect
-                if abs(log2fc) < 0.1:
-                    effect_label = "NEUTRAL"
-                elif log2fc > 0:
-                    effect_label = f"↑ INCREASED ({fold_change:.2f}x)"
-                else:
-                    effect_label = f"↓ DECREASED ({fold_change:.2f}x)"
-
-                result["effects"][attr_name] = {
-                    "ref_mean": ref_stats["mean"],
-                    "alt_mean": alt_stats["mean"],
-                    "difference": diff,
-                    "fold_change": fold_change,
-                    "log2_fold_change": log2fc,
-                    "effect": effect_label,
-                    "units": type_info.units if type_info else "unknown",
-                }
-            
-            # Add interpretation guidance
-            result["interpretation"] = [
-                "⚠️ Predictions are relative, not absolute measurements",
-                "• Large changes (|Δ| > 0.01) may indicate regulatory variants",
-                "• ATAC/DNase changes suggest altered chromatin accessibility",
-                "• CAGE changes suggest altered transcription initiation",
-                "• ChIP changes suggest altered protein binding",
-                "• Validate significant predictions experimentally",
-                "• Use quantile scores for cross-assay comparisons",
-            ]
-            
-        except Exception as e:
-            result["error"] = f"Variant prediction failed: {str(e)}"
-            logger.exception("AlphaGenome variant prediction error")
-        
-        return result
-    
-    def get_available_tracks(
-        self,
-        output_type: str,
-        tissue: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """
-        Get available tracks for an output type.
-        
-        Useful for discovering what TFs, histone marks, or tissues are available.
-        
-        Args:
-            output_type: The output type (e.g., "chip_tf", "chip_histone")
-            tissue: Optional tissue filter
-            
-        Returns:
-            Dict with available tracks and their metadata
-        """
-        if not self.output_metadata:
-            return {"error": "Output metadata not loaded"}
-        
-        # Get the metadata dataframe
-        output_types = self._resolve_assays([output_type])
-        if not output_types:
-            return {"error": f"Unknown output type: {output_type}"}
-        
-        attr_name = output_types[0].name.lower()
-        if not hasattr(self.output_metadata, attr_name):
-            return {"error": f"No metadata for {output_type}"}
-        
-        metadata_df = getattr(self.output_metadata, attr_name)
-        
-        # Filter by tissue if specified
-        if tissue:
-            try:
-                ontology_id = self._resolve_tissue(tissue)
-                if "ontology_curie" in metadata_df.columns:
-                    metadata_df = metadata_df[
-                        metadata_df["ontology_curie"] == ontology_id
-                    ]
-            except ValueError:
-                pass  # Keep all if tissue not found
-        
-        result = {
-            "output_type": output_types[0].name,
-            "total_tracks": len(metadata_df),
-            "columns": list(metadata_df.columns),
-        }
-        
-        # Summarize key columns
-        if "biosample_name" in metadata_df.columns:
-            result["biosamples"] = sorted(metadata_df["biosample_name"].unique().tolist())
-        
-        if "transcription_factor" in metadata_df.columns:
-            tfs = metadata_df["transcription_factor"].dropna().unique()
-            result["transcription_factors"] = sorted(tfs.tolist())
-            result["n_tfs"] = len(tfs)
-        
-        if "histone_mark" in metadata_df.columns:
-            marks = metadata_df["histone_mark"].dropna().unique()
-            result["histone_marks"] = sorted(marks.tolist())
-        
-        if "strand" in metadata_df.columns:
-            result["strands"] = metadata_df["strand"].unique().tolist()
-        
-        return result
-
-
-# ============================================================================
-# FORMAT OUTPUT FOR AGENT USE
-# ============================================================================
-
-def format_prediction_report(result: Dict[str, Any]) -> str:
-    """Format prediction result as a readable report."""
-    if "error" in result and not result.get("predictions"):
-        return f"❌ Error: {result['error']}"
-    
-    lines = []
-    lines.append("=" * 60)
-    lines.append("**AlphaGenome Prediction Report**")
-    lines.append("=" * 60)
-    
-    # Query info
-    q = result.get("query", {})
-    lines.append(f"Region: {q.get('location', 'N/A')} ({q.get('size_bp', 0):,} bp)")
-    lines.append(f"Tissue: {q.get('tissue', 'N/A')} ({q.get('ontology_id', 'N/A')})")
-    lines.append(f"Assays: {', '.join(q.get('assays', []))}")
-    lines.append(f"Context: {q.get('context_window', 'N/A')}")
-    lines.append("")
-    
-    # Predictions
-    lines.append("**Predictions:**")
-    lines.append("-" * 40)
-    
-    for assay, data in result.get("predictions", {}).items():
-        if "error" in data:
-            lines.append(f"• {assay.upper()}: {data['error']}")
-            continue
-        
-        agg = data.get("aggregate", {})
-        lines.append(f"• {assay.upper()}:")
-        lines.append(f"    Mean: {agg.get('mean', 0):.4f}")
-        lines.append(f"    Max:  {agg.get('max', 0):.4f}")
-        lines.append(f"    Range: [{agg.get('min', 0):.4f} - {agg.get('max', 0):.4f}]")
-        lines.append(f"    ({data.get('n_tracks', 0)} tracks, {agg.get('n_bins', 0)} bins × {data.get('resolution_bp', 1)}bp)")
-        lines.append(f"    Units: {data.get('units', 'N/A')}")
-        
-        # Top tracks
-        top = data.get("top_tracks", [])[:3]
-        if top:
-            lines.append("    Top tracks:")
-            for t in top:
-                meta = t.get("metadata", {})
-                name = meta.get("biosample_name", meta.get("name", "unnamed"))
-                extra = ""
-                if "transcription_factor" in meta:
-                    extra = f" [{meta['transcription_factor']}]"
-                elif "histone_mark" in meta:
-                    extra = f" [{meta['histone_mark']}]"
-                lines.append(f"      - {name}{extra}: {t['stats']['mean']:.4f}")
-    
-    # Interpretation
-    lines.append("")
-    lines.append("**Interpretation Guide:**")
-    for assay, interp in result.get("interpretation", {}).items():
-        lines.append(f"• {assay.upper()}: {interp}")
-    
-    # Tissue comparison
-    if result.get("tissue_comparison"):
-        lines.append("")
-        lines.append("**Tissue Comparison:**")
-        for tissue, data in result["tissue_comparison"].items():
-            if "error" in data:
-                lines.append(f"  {tissue}: {data['error']}")
-            else:
-                tissue_line = f"  {tissue}: "
-                parts = [f"{k}={v.get('mean', 0):.4f}" for k, v in data.items()]
-                tissue_line += ", ".join(parts)
-                lines.append(tissue_line)
-    
-    if "error" in result:
-        lines.append("")
-        lines.append(f"⚠️ Warning: {result['error']}")
-    
-    return "\n".join(lines)
-
-
-def format_variant_report(result: Dict[str, Any]) -> str:
-    """Format variant effect result as a readable report."""
-    if "error" in result and not result.get("effects"):
-        return f"❌ Error: {result['error']}"
-    
-    lines = []
-    lines.append("=" * 60)
-    lines.append("**AlphaGenome Variant Effect Prediction**")
-    lines.append("=" * 60)
-    
-    v = result.get("variant", {})
-    lines.append(f"Variant: {v.get('location', 'N/A')} {v.get('ref', '?')}>{v.get('alt', '?')}")
-    lines.append(f"Tissue: {v.get('tissue', 'N/A')}")
-    lines.append("")
-    
-    lines.append("**Predicted Effects (ALT vs REF):**")
-    lines.append("-" * 40)
-    
-    for assay, data in result.get("effects", {}).items():
-        if "error" in data:
-            lines.append(f"• {assay.upper()}: {data['error']}")
-            continue
-        
-        lines.append(f"• {assay.upper()}:")
-        lines.append(f"    REF: {data.get('ref_mean', 0):.4f}")
-        lines.append(f"    ALT: {data.get('alt_mean', 0):.4f}")
-        lines.append(f"    Δ = {data.get('difference', 0):+.4f} ({data.get('fold_change', 1):.2f}x) → {data.get('effect', 'NEUTRAL')}")
-    
-    lines.append("")
-    lines.append("**Interpretation:**")
-    for interp in result.get("interpretation", []):
-        lines.append(interp)
-    
-    return "\n".join(lines)
-
-
-# ============================================================================
-# LANGCHAIN TOOLS (if using with an agent)
-# ============================================================================
-
-try:
-    from langchain_core.tools import tool
-    
-    # Global handler instance
-    _ag_handler = None
-    
-    def _get_handler() -> AlphaGenomeHandler:
-        global _ag_handler
-        if _ag_handler is None:
-            _ag_handler = AlphaGenomeHandler()
-        return _ag_handler
-    
-    @tool
-    def alphagenome_predict(
-        location: str,
-        tissue: str = "lung",
-        assays: str = "atac,dnase,rna",
-        compare_tissues: str = "",
-        filter_tf: str = "",
-        filter_histone: str = "",
-    ) -> str:
-        """
-        Predict functional genomic signals for a region using AlphaGenome AI.
-        
-        Best for: Predicting chromatin accessibility, transcription, TF binding,
-        histone modifications, and splicing at any genomic region.
-        
-        Args:
-            location: Genomic coordinates "chr:start-end" (GRCh38).
-                     Example: "chr17:7676000-7677000" (TP53 promoter)
-            tissue: Target tissue/cell type. Options include:
-                   Tissues: lung, liver, brain, heart, kidney, colon, breast, etc.
-                   Cell lines: k562, hepg2 (BEST for TF binding - 269/501 TFs!)
-                   Cell types: hepatocyte, neuron, t_cell, etc.
-            assays: Comma-separated assay types:
-                   - atac, dnase: Chromatin accessibility
-                   - rna, cage, procap: Gene expression/TSS
-                   - histone: Histone modifications (H3K4me3, H3K27ac, etc.)
-                   - tf: Transcription factor binding (CTCF, etc.)
-                   - splice, splice_usage, junctions: Splicing
-                   - contacts: 3D chromatin (Hi-C)
-            compare_tissues: Optional comma-separated tissues to compare
-            filter_tf: Filter ChIP-TF to specific TF (e.g., "CTCF")
-            filter_histone: Filter ChIP-Histone to specific mark (e.g., "H3K4me3")
-            
-        Returns:
-            Prediction report with signal values and interpretation guidance.
-            
-        Note:
-            - Predictions are RELATIVE, not absolute measurements
-            - Best for COMPARING regions or tissues
-            - ChIP outputs are fold-change over control (>1 = enriched)
-            - Cell lines K562/HepG2 have best TF coverage
-        """
-        handler = _get_handler()
-        if not handler.client:
-            return "❌ AlphaGenome not available. Check API key (ALPHAGENOME_API_KEY)."
-        
-        assay_list = [a.strip() for a in assays.split(",") if a.strip()]
-        compare_list = [t.strip() for t in compare_tissues.split(",") if t.strip()] or None
-        
-        result = handler.predict_region(
-            location=location,
+        return self.predict_coordinates(
+            coordinates=coordinates,
             tissue=tissue,
-            assays=assay_list,
-            compare_tissues=compare_list,
-            filter_tf=filter_tf or None,
-            filter_histone=filter_histone or None,
+            assays=assays,
+            sequence_length=sequence_length,
+            aggregate_by=aggregate_by
         )
-        
-        return format_prediction_report(result)
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def format_results(results: Dict[str, Any]) -> str:
+    """Format prediction results as readable text."""
+    lines = []
+    lines.append("=" * 70)
+    lines.append(f"AlphaGenome Predictions")
     
-    @tool
-    def alphagenome_variant_effect(
-        location: str,
-        ref_allele: str,
-        alt_allele: str,
-        tissue: str = "lung",
-        assays: str = "atac,dnase,rna,cage",
-    ) -> str:
-        """
-        Predict the regulatory effect of a genetic variant using AlphaGenome.
-        
-        Compares predictions between reference and alternate alleles to
-        identify potential regulatory variants affecting chromatin, expression, etc.
-        
-        Args:
-            location: Variant position "chr:position" (1-based, GRCh38)
-                     Example: "chr17:7676100"
-            ref_allele: Reference allele (e.g., "A", "ACGT" for indels)
-            alt_allele: Alternate allele (e.g., "G", "T")
-            tissue: Target tissue for prediction
-            assays: Assay types to evaluate effects on
-            
-        Returns:
-            Report showing REF vs ALT predictions and predicted effect direction.
-            
-        Example:
-            alphagenome_variant_effect(
-                location="chr17:7676100",
-                ref_allele="C",
-                alt_allele="T", 
-                tissue="lung"
-            )
-        """
-        handler = _get_handler()
-        if not handler.client:
-            return "❌ AlphaGenome not available. Check API key."
-        
-        assay_list = [a.strip() for a in assays.split(",") if a.strip()]
-        
-        result = handler.predict_variant(
-            location=location,
-            ref_allele=ref_allele,
-            alt_allele=alt_allele,
-            tissue=tissue,
-            assays=assay_list,
-        )
-        
-        return format_variant_report(result)
-    
-    @tool
-    def alphagenome_available_tracks(
-        output_type: str,
-        tissue: str = "",
-    ) -> str:
-        """
-        List available tracks for an AlphaGenome output type.
-        
-        Use this to discover what transcription factors, histone marks,
-        or tissues are available for prediction.
-        
-        Args:
-            output_type: The output type to query:
-                        - "tf" or "chip_tf": List available TFs
-                        - "histone" or "chip_histone": List histone marks
-                        - "atac", "dnase", "rna", etc.: List tissues
-            tissue: Optional tissue filter (especially useful for TF)
-            
-        Returns:
-            List of available tracks with metadata.
-            
-        Example:
-            # See what TFs are available in K562
-            alphagenome_available_tracks(output_type="tf", tissue="k562")
-            
-            # See what histone marks are available
-            alphagenome_available_tracks(output_type="histone")
-        """
-        handler = _get_handler()
-        if not handler.client:
-            return "❌ AlphaGenome not available."
-        
-        result = handler.get_available_tracks(
-            output_type=output_type,
-            tissue=tissue or None,
-        )
-        
-        if "error" in result:
-            return f"❌ {result['error']}"
-        
-        lines = [f"**Available tracks for {result['output_type']}:**"]
-        lines.append(f"Total tracks: {result['total_tracks']}")
-        
-        if "transcription_factors" in result:
-            lines.append(f"\nTranscription Factors ({result['n_tfs']}):")
-            lines.append(", ".join(result["transcription_factors"][:20]))
-            if result["n_tfs"] > 20:
-                lines.append(f"  ... and {result['n_tfs'] - 20} more")
-        
-        if "histone_marks" in result:
-            lines.append(f"\nHistone Marks: {', '.join(result['histone_marks'])}")
-        
-        if "biosamples" in result:
-            lines.append(f"\nBiosamples ({len(result['biosamples'])}):")
-            lines.append(", ".join(result["biosamples"][:10]))
-            if len(result["biosamples"]) > 10:
-                lines.append(f"  ... and {len(result['biosamples']) - 10} more")
-        
+    if "error" in results:
+        lines.append(f"❌ ERROR: {results['error']}")
+        if results.get('validation_failed'):
+            lines.append("\nOntology validation failed. Available options depend on the assay type.")
+            lines.append("Use predictor.get_available_assays() to see valid combinations.")
+        lines.append("=" * 70)
         return "\n".join(lines)
-
-except ImportError:
-    # LangChain not available - that's fine, handler still works
-    pass
+    
+    lines.append(f"Tissue: {results.get('tissue', 'N/A')} ({results.get('ontology_id', 'N/A')})")
+    lines.append(f"Assays: {', '.join(results.get('assays', []))}")
+    if results.get('validation_skipped'):
+        lines.append("⚠️  Validation skipped")
+    lines.append("=" * 70)
+    
+    for result in results.get('results', []):
+        lines.append("")
+        if "error" in result:
+            lines.append(f"❌ {result['coordinates']}: ERROR - {result['error']}")
+            continue
+        
+        lines.append(f"📍 {result['coordinates']}")
+        lines.append(f"   Input window: {result['input_interval']} ({result['sequence_length']:,} bp)")
+        
+        for assay_name, assay_data in result.get('assays', {}).items():
+            lines.append(f"\n   📊 {assay_name.upper()}:")
+            lines.append(f"      Resolution: {assay_data['resolution_bp']} bp")
+            lines.append(f"      Signal (mean/max): {assay_data['aggregate_signal']:.4f} / {assay_data['max_signal']:.4f}")
+    
+    return "\n".join(lines)
 
 
 # ============================================================================
-# MAIN / TESTING
+# MAIN
 # ============================================================================
 
 if __name__ == "__main__":
-    # Quick test
-    handler = AlphaGenomeHandler()
+    print("AlphaGenome Coordinate Prediction Tool with Ontology Validation")
+    print("=" * 70)
     
-    if handler.client:
-        print("Testing AlphaGenome prediction...")
-        result = handler.predict_region(
-            location="chr17:7676000-7677000",  # TP53 region
-            tissue="lung",
-            assays=["atac", "dnase", "rna"],
+    try:
+        predictor = AlphaGenomePredictor()
+        
+        # Example: Check available assays first
+        print("\nAvailable assays and sample ontologies:")
+        available = predictor.get_available_assays()
+        for assay, ontologies in available.items():
+            print(f"  {assay}: {len(ontologies)} ontologies")
+            if ontologies and not ontologies[0].startswith("Error"):
+                print(f"    Examples: {', '.join(ontologies[:3])}")
+        
+        # Example: Predict with validation
+        print("\n" + "=" * 70)
+        print("Example prediction with validation:")
+        result = predictor.predict_coordinates(
+            coordinates="chr17:7676000-7677000",
+            tissue="lung",  # Will be resolved to UBERON:0002048 if valid for ATAC
+            assays=["atac"],
+            sequence_length="auto"
         )
-        print(format_prediction_report(result))
-    else:
-        print("AlphaGenome client not initialized. Set ALPHAGENOME_API_KEY.")
+        print(format_results(result))
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        print("\nSetup:")
+        print("1. pip install alphagenome")
+        print("2. export ALPHAGENOME_API_KEY='your-key'")
