@@ -65,9 +65,6 @@ def gene_info_tool(gene_symbol: str) -> str:
     """
     Get authoritative information about a gene from NCBI and UniProt.
     
-    ALWAYS use this tool FIRST before answering questions about a gene's
-    function, expression, or role in disease. This prevents hallucination.
-    
     Args:
         gene_symbol: Gene symbol (e.g., "EGFR", "TP53", "EGFLAM")
     
@@ -231,16 +228,6 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
     """
     Query gene expression from GTEx (bulk RNA-seq across human tissues).
     
-    This tool provides tissue-level expression data from the Genotype-Tissue 
-    Expression (GTEx) project. It measures average expression across all cells
-    in a tissue sample (bulk RNA-seq), which is complementary to single-cell data.
-    
-    Use this when:
-    - You need tissue-level expression quantification (TPM values)
-    - Comparing expression across different tissues
-    - Checking if a gene is broadly expressed in a tissue
-    - GTEx data is the gold standard for tissue transcriptomics
-    
     Args:
         gene_symbol: Gene name (e.g., "TERT", "EGFR", "TP53") or Ensembl ID
         tissue: Optional tissue filter (e.g., "Lung", "Brain", "Liver", "Heart")
@@ -250,13 +237,6 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
         - Median expression across tissue samples
         - Rank of tissues by expression level
         - Sample size (number of donors)
-    
-    Example queries:
-        - "TERT expression across all tissues"
-        - "EGFR levels in brain vs lung"
-        - "Which tissues express TP53 highest?"
-    
-    Note: GTEx measures bulk tissue averages. 
     """
     input_symbol = gene_symbol.strip()
     output = [f"**GTEx Tissue Expression Analysis (Bulk RNA-seq)**"]
