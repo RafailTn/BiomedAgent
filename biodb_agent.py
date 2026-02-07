@@ -1,5 +1,6 @@
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["ATLASAPPROX_HIDECREDITS"] = "yes"
 from Bio import Entrez
 from datetime import date
 from langchain.agents import create_agent
@@ -19,8 +20,11 @@ import asyncio
 import aiohttp
 from collections import defaultdict
 from pathlib import Path
+import pandas as pd
 import logging
 import requests
+import atlasapprox
+import difflib
 from pathway_tools import (
     # STRING
     string_get_interactions,
@@ -33,7 +37,6 @@ from pathway_tools import (
     kegg_find_pathways_for_genes,
     kegg_disease_pathways,
 )
-from call_cellxgene import SingleCellQueryTool
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -429,68 +432,63 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
         return "\n".join(output)
 
 @tool
-def sc_expression_query_tool(
-    organism: str = "Homo sapiens",
-    tissue: str = None,
-    cell_type: str = None,
-    disease: str = None,
-    genes: str = None
-) -> str:
+def get_gene_fraction_detected(gene_symbol, tissue_query, organism="h_sapiens"):
     """
-    Query single-cell gene expression data from the CELLxGENE Census.
-    
     Args:
-        organism: "Homo sapiens" or "Mus musculus" (default: Homo sapiens)
-        tissue: Tissue name (e.g., "lung", "blood", "brain")
-        cell_type: Specific cell type (e.g., "T cell", "macrophage")
-        disease: Disease state (e.g., "COVID-19", "normal", "pulmonary fibrosis")
-        genes: Comma-separated list of gene symbols (e.g., "ACE2,TMPRSS2")
+        - gene_symbol: Name of the gene requested
+        - tissue_query: Name of the tissue/organ requested
+    Output:
+        Top 20 cell types in the tissue/organ the gene is expressed
     """
+    api = atlasapprox.API()
+
+    # --- STEP 1: Smart Tissue Validation ---
     try:
-        # Convert comma-separated string to list
-        gene_list = [g.strip() for g in genes.split(",")] if genes else None
+        # Fetch all valid organs for this organism
+        valid_organs = api.organs(organism=organism)
         
-        # Use the tool with a context manager to ensure connection closes
-        with SingleCellQueryTool() as sc_tool:
-            result = sc_tool.query_expression(
-                organism=organism,
-                tissue=tissue,
-                cell_type=cell_type,
-                disease=disease,
-                genes=gene_list,
-                max_cells=10000 # Limit to prevent timeouts
-            )
-            return json.dumps(result.to_dict(), indent=2)
-    except Exception as e:
-        return f"Error querying Single-Cell Census: {str(e)}"
+        # Exact case-insensitive match
+        match = next((o for o in valid_organs if o.lower() == tissue_query.lower()), None)
+        
+        # If no exact match, try fuzzy matching (e.g. "lungs" -> "Lung")
+        if not match:
+            return {f"Tissue not found. Available tissues: {valid_organs}"}
+        
+        actual_tissue = match
 
-@tool
-def sc_find_markers_tool(
-    cell_type: str,
-    tissue: str,
-    organism: str = "Homo sapiens"
-) -> str:
-    """
-    Identify marker genes that distinguish a specific cell type in a tissue.
-    
-    Args:
-        cell_type: The target cell type (e.g., "B cell")
-        tissue: The tissue to search in (e.g., "blood")
-        organism: "Homo sapiens" or "Mus musculus"
-    """
-    try:
-        with SingleCellQueryTool() as sc_tool:
-            markers = sc_tool.find_marker_genes(
-                organism=organism,
-                cell_type=cell_type,
-                tissue=tissue,
-                top_n=10
-            )
-            return json.dumps(markers, indent=2)
-    except Exception as e:
-        return f"Error finding markers: {str(e)}"
+        # --- STEP 2: Query Fraction Detected ---
+        # "fraction_detected" returns how many cells have non-zero expression (0.0 to 1.0)
+        response = api.fraction_detected(organism=organism, organ=actual_tissue, features=[gene_symbol])
 
-# ============================================
+        df = pd.DataFrame(response)
+
+        # Extract the row for our gene as a Series
+        gene_series = df.loc[gene_symbol]
+        
+        # Sort descending by fraction detected
+        gene_series = gene_series.sort_values(ascending=False)
+        
+        # Take Top 20
+        top_20 = gene_series.head(20)
+
+        # Format for the Agent
+        results = []
+        for cell_type, fraction in top_20.items():
+            results.append({
+                "cell_type": cell_type,
+                "fraction_detected": float(fraction),        # e.g. 0.85
+                "percent_detected": f"{fraction * 100:.1f}%" # e.g. "85.0%"
+            })
+
+        return {
+            "gene": gene_symbol,
+            "tissue": actual_tissue,
+            "data": results
+        }
+
+    except Exception as e:
+        return {"error": f"An error occurred: {str(e)}"}
+
 # AGENT SETUP
 # ============================================
 
@@ -516,13 +514,8 @@ system_prompt = """You are an advanced Biomedical Research Agent. Your goal is t
         * *Source:* GTEx (Bulk RNA-seq). Measures average expression in whole tissue samples.
     
     * **Context B: "Single Cell / Specific Cell Types"** (e.g., "Is ACE2 expressed in Alveolar Macrophages?", "Compare T-cells vs B-cells")
-        * Use `sc_expression_query_tool(genes, cell_type, tissue, disease)`
-        * *Source:* CELLxGENE Census (scRNA-seq). Measures expression in individual cells.
-        * *Note:* Use specific filters (e.g., `tissue="lung"`, `disease="COVID-19"`) if provided.
-
-    * **Context C: "Cell Markers / Identity"** (e.g., "What genes distinguish Microglia?", "Find markers for B-cells")
-        * Use `sc_find_markers_tool(cell_type, tissue)`
-        * *Goal:* Identify genes that uniquely define a specific cell population.
+        * Use `get_gene_fraction_detected(gene_symbol, tissue)`
+        * *Source:* AtlasApprox (scRNA-seq). Measures expression in individual cells.
 
 ## CATEGORY 2: PROTEIN INTERACTIONS ("What interacts with GENE?")
 * **Protein-Protein Interactions (STRING)**
@@ -557,7 +550,7 @@ system_prompt = """You are an advanced Biomedical Research Agent. Your goal is t
 * **Gene Function:** Start with the official summary from `gene_info_tool`.
 * **Expression Data:**
     * **Bulk (GTEx):** Report the units (TPM).
-    * **Single Cell:** Report the **% of cells expressing** the gene and the **mean expression** level.
+    * **Single Cell:** Report the **% of cells expressing** the gene.
 * **Interactions (STRING):**
     * Report confidence level (high/medium/low based on score).
     * Mention evidence types if relevant (experimental, database, text-mining).
@@ -575,8 +568,7 @@ system_prompt = """You are an advanced Biomedical Research Agent. Your goal is t
 tools = [
     gene_tissue_expression_tool,
     gene_info_tool,
-    sc_find_markers_tool,
-    sc_expression_query_tool,
+    get_gene_fraction_detected,
     # STRING
     string_get_interactions,
     string_functional_enrichment,
