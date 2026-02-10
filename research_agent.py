@@ -891,11 +891,6 @@ def get_promoter_region(gene_symbol: str, upstream: int = 1500, downstream: int 
 @tool
 def get_promoter_coordinates_tool(gene_symbol: str, upstream: int = 1500, downstream: int = 500) -> str:
     """
-    Get the PROMOTER region coordinates for a gene (NOT the whole gene).
-    
-    Use this when analyzing promoter activity, H3K4me3, CAGE signal, etc.
-    Returns ~2kb region around the transcription start site (TSS).
-    
     Args:
         gene_symbol: Gene name (e.g., "TP53", "EGFR")
         upstream: Base pairs upstream of TSS (default 1500)
