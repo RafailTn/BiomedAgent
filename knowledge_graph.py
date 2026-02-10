@@ -105,6 +105,8 @@ class GLiNERExtractor:
             raise ImportError("GLiNER not installed. Run: pip install gliner --break-system-packages")
         
         logger.info(f"Loading GLiNER on {self.device}...")
+        import warnings
+        warnings.filterwarnings("ignore", message="Resizing embeddings")
         self.model = GLiNER.from_pretrained(self.model_name)
         
         if self.device == "cuda" and torch.cuda.is_available():
