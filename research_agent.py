@@ -1,4 +1,3 @@
-
 """
 PubMed Research Agent v4.0
 ==========================
@@ -904,20 +903,34 @@ async def async_pubmed_search_and_store(keywords, years=None, pnum=10):
             total_skipped += 1
     
     # ========================================
-    # STEP 6: [IMPROVEMENT 4] Citation Traversal
+    # STEP 6: [IMPROVEMENT 4] Citation Traversal (query-filtered)
     # ========================================
-    # Take top 3 most-cited stored papers and fetch their references
+    # Take top 3 most-cited stored papers, fetch their references,
+    # but ONLY store references that are relevant to the original query.
     citation_stored = 0
     if stored_with_s2_ids:
+        # Prepare query keywords for relevance filtering
+        query_keywords = set(re.findall(r'\w+', keywords.lower()))
+        query_stop_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'of', 'in', 'to', 'for',
+                            'and', 'or', 'on', 'with', 'by', 'from', 'what', 'how', 'which', 'about',
+                            'does', 'do', 'can', 'role', 'effect', 'between', 'this', 'that', 'it'}
+        query_keywords -= query_stop_words
+        
         # Sort by citation count, take top 3
         top_cited = sorted(stored_with_s2_ids, key=lambda x: x.get("citation_count", 0), reverse=True)[:3]
         
         for paper in top_cited:
-            refs = s2_fetcher.get_references(paper["s2_id"], limit=10)
+            refs = s2_fetcher.get_references(paper["s2_id"], limit=15)
             for ref in refs:
                 ref_text = ref.get('abstract', '')
                 if not ref_text:
                     continue
+                
+                # Filter: only store if reference is relevant to original query
+                ref_lower = (ref.get('title', '') + " " + ref_text).lower()
+                matched = sum(1 for kw in query_keywords if kw in ref_lower)
+                if not query_keywords or (matched / len(query_keywords)) < 0.4:
+                    continue  # Skip irrelevant references
                 
                 # Check full-text for references too (if they have real PMIDs)
                 if not ref["pmid"].startswith("S2:") and ref["pmid"] in full_texts and full_texts[ref["pmid"]]:
