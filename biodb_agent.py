@@ -356,11 +356,11 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
                     output.append(f"   • {exp.get('tissueSiteDetailId')}")
         
         else:
-            output.append(f"**Top 10 Tissues by Expression:**")
+            output.append(f"**Tissues by Expression:**")
             output.append(f"{'Rank':<5} {'Tissue':<35} {'Median TPM':>12} {'n':>5}")
             output.append(f"{'-'*5} {'-'*35} {'-'*12} {'-'*5}")
             
-            for rank, exp in enumerate(sorted_exp[:10], 1):
+            for rank, exp in enumerate(sorted_exp, 1):
                 tissue_name = exp.get("tissueSiteDetailId", "Unknown")[:34]
                 median = exp.get("median", 0)
                 n_samples = exp.get("nSamples", "N/A")
