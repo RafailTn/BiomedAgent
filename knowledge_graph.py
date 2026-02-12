@@ -109,6 +109,10 @@ class GLiNERExtractor:
         warnings.filterwarnings("ignore", message="Resizing embeddings")
         self.model = GLiNER.from_pretrained(self.model_name)
         
+        # FIX: Set max_length to prevent unbounded tokenization
+        if hasattr(self.model, 'data_processor') and hasattr(self.model.data_processor, 'transformer_tokenizer'):
+            self.model.data_processor.transformer_tokenizer.model_max_length = 512
+
         if self.device == "cuda" and torch.cuda.is_available():
             self.model = self.model.to(self.device)
         else:
