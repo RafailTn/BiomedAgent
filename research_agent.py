@@ -1,14 +1,14 @@
 """
-PubMed Research Agent v3.2
+PubMed Research Agent v3.3
 ==========================
-Main agent script that imports KG functionality from knowledge_graph.py
+Optimized for 8B parameter models (Ministral 3 8B).
 
-Features:
-- MedCPT asymmetric embeddings for biomedical retrieval
-- BM25 + Dense hybrid search with RRF fusion
-- Knowledge graph integration for hallucination reduction
-- Async PubMed fetching with full-text support
-- **Integrated Fast PrimeKG Loading**
+Changes from v3.2:
+- Merged check_rag + search_rag into single `search_literature_tool`
+- All tool docstrings compressed to 1 line (prevents hallucination from extra tokens)
+- System prompt restructured as keyword-routing table
+- PMID hallucination guard: RAG tool explicitly flags when no papers match
+- Tool count reduced from 10 to 9
 """
 
 import os
@@ -45,15 +45,14 @@ from pydantic import BaseModel, Field
 import logging
 import requests
 import numpy as np
+
 # NEW: Import AlphaGenome (Wrap in try/except to prevent crash if not installed)
 try:
     from alphagenome.models import dna_client
     from alphagenome.data import genome
-    # Mocking Enums/Constants for context if library isn't present during dry-run
     ALPHAGENOME_AVAILABLE = True
 except ImportError:
     ALPHAGENOME_AVAILABLE = False
-    logger.warning("AlphaGenome library not found. Tool will be disabled.")
 
 # Import knowledge graph module
 from knowledge_graph import KnowledgeGraphManager
@@ -61,6 +60,10 @@ from alphagenome_tool import AlphaGenomePredictor
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+if not ALPHAGENOME_AVAILABLE:
+    logger.warning("AlphaGenome library not found. Tool will be disabled.")
+
 # Constants
 REQUEST_TIMEOUT = 15
 
@@ -318,7 +321,7 @@ class AsyncPubMedFetcher:
 # ============================================
 
 logger.info("="*60)
-logger.info("PubMed Research Agent v3.2")
+logger.info("PubMed Research Agent v3.3")
 logger.info("="*60)
 
 # MedCPT embeddings
@@ -354,32 +357,21 @@ async_fetcher = AsyncPubMedFetcher(email=Entrez.email, api_key=os.getenv("NCBI_A
 kg_manager: Optional[KnowledgeGraphManager] = None
 
 if ENABLE_KNOWLEDGE_GRAPH:
-    # ----------------------------------------------------
-    # FIX: ROBUST DATABASE CHECK
-    # ----------------------------------------------------
-    # We check if the DB path exists. We removed .iterdir() so it won't crash 
-    # if the OS sees the database as a file instead of a folder.
-    
     db_missing = not KUZU_DB_PATH.exists()
     
-    # If it exists, we check if it's suspiciously small (e.g. < 1KB), which implies it's empty/corrupt
     is_empty = False
     if KUZU_DB_PATH.exists():
         try:
-            # Check size depending on if it's a file or folder
             if KUZU_DB_PATH.is_file():
                 is_empty = KUZU_DB_PATH.stat().st_size < 1024
             elif KUZU_DB_PATH.is_dir():
-                # If it's a folder, check if it has content
                 is_empty = not any(KUZU_DB_PATH.iterdir())
         except Exception:
-            # If we can't check, assume it might need reloading
             pass
 
     if LOAD_PRIMEKG and (db_missing or is_empty):
         logger.info("!!! Database missing or empty. Automatically triggering FAST loader... !!!")
         try:
-            # Dynamically import the fast loader script
             import load_primekg
             
             logger.info("--- Step 1: Checking Data ---")
@@ -404,7 +396,6 @@ if ENABLE_KNOWLEDGE_GRAPH:
         kg_manager = KnowledgeGraphManager(
             db_path=KUZU_DB_PATH,
             gliner_device=GLINER_DEVICE,
-            # We set load_primekg=False here because we handled the loading above (if needed)
             load_primekg=False,  
             primekg_limit=PRIMEKG_LIMIT,
             primekg_data_dir=PRIMEKG_DATA_DIR
@@ -424,7 +415,7 @@ logger.info(f"VRAM: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 # ============================================
 
 def kg_enhanced_search(query, num_results=10):
-    """Search with KG enhancement."""
+    """Search with KG enhancement. Returns (results_text, kg_context, has_relevant_papers)."""
     kg_context = ""
     
     if kg_manager and ENABLE_KG_ENHANCED_RETRIEVAL:
@@ -438,7 +429,7 @@ def kg_enhanced_search(query, num_results=10):
     
     results = hybrid_retriever.search(query, k=num_results * 2)
     if not results:
-        return "No papers found.", kg_context
+        return "NO_PAPERS_FOUND", kg_context, False
     
     # Deduplicate
     seen = set()
@@ -447,6 +438,27 @@ def kg_enhanced_search(query, num_results=10):
     
     # Rerank
     results = compressor.compress_documents(unique, query)[:num_results] if len(unique) > 1 else unique[:num_results]
+    
+    # ====================================================
+    # RELEVANCE CHECK: Determine if results actually match
+    # ====================================================
+    # Extract query keywords for relevance scoring
+    query_keywords = set(re.findall(r'\w+', query.lower()))
+    # Remove common stop words
+    stop_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'of', 'in', 'to', 'for',
+                  'and', 'or', 'on', 'with', 'by', 'from', 'what', 'how', 'which', 'about',
+                  'does', 'do', 'can', 'role', 'effect', 'between', 'this', 'that', 'it'}
+    query_keywords -= stop_words
+    
+    relevant_paper_count = 0
+    for doc in results:
+        content_lower = doc.page_content.lower()
+        matched = sum(1 for kw in query_keywords if kw in content_lower)
+        # A paper is "relevant" if it matches at least 40% of query keywords
+        if query_keywords and (matched / len(query_keywords)) >= 0.4:
+            relevant_paper_count += 1
+    
+    has_relevant = relevant_paper_count > 0
     
     # Format output
     papers = {}
@@ -468,7 +480,7 @@ def kg_enhanced_search(query, num_results=10):
                      f"Authors: {info['authors']}\nYear: {info['year']}\n"
                      f"{content}...\n{'='*40}")
     
-    return "".join(output), kg_context
+    return "".join(output), kg_context, has_relevant
 
 
 # ============================================
@@ -540,38 +552,46 @@ def pubmed_search_and_store(keywords, years=None, pnum=10):
 
 
 # ============================================
-# TOOLS
+# TOOLS (1-line docstrings for 8B model)
 # ============================================
 
 @tool
 def pubmed_search_and_store_tool(keywords: str, years: str = None, pnum: int = 10) -> str:
-    """Search PubMed and store papers in the database."""
+    """Fetch papers from PubMed and store them locally. Use BEFORE search_literature_tool."""
     return pubmed_search_and_store(keywords, years, pnum)
 
 
 @tool
-def search_rag_database_tool(query: str, num_results: int = 10) -> str:
-    """Search the database with KG-enhanced retrieval."""
-    results, kg_context = kg_enhanced_search(query, num_results)
-    return f"{kg_context}\n\n{results}" if kg_context else results
-
-
-@tool
-def check_rag_for_topic_tool(keywords: str) -> str:
-    """Check if papers exist for a topic."""
-    results = hybrid_retriever.search(keywords, k=5)
-    if not results:
-        return f"No papers for '{keywords}'"
-    papers = {d.metadata.get("pmid"): d.metadata.get("title") 
-              for d in results if d.metadata.get("pmid")}
-    return f"Found {len(papers)} papers:\n" + "\n".join(
-        f"• PMID:{p} | {t[:50]}..." for p, t in papers.items()
-    )
+def search_literature_tool(query: str, num_results: int = 10) -> str:
+    """Search stored papers with KG context. Only cite PMIDs from this output."""
+    results, kg_context, has_relevant = kg_enhanced_search(query, num_results)
+    
+    # ====================================================
+    # ANTI-HALLUCINATION GUARD
+    # ====================================================
+    if results == "NO_PAPERS_FOUND" or not has_relevant:
+        no_data_msg = (
+            "⚠️ NO RELEVANT PAPERS IN DATABASE for this query.\n"
+            "DO NOT cite any PMIDs. DO NOT invent references.\n"
+            "→ Tell the user: no stored papers match this topic.\n"
+            "→ Suggest: use pubmed_search_and_store_tool to fetch papers first."
+        )
+        if kg_context:
+            return f"{kg_context}\n\n{no_data_msg}"
+        return no_data_msg
+    
+    # Normal case: relevant papers found
+    output = ""
+    if kg_context:
+        output = f"{kg_context}\n\n"
+    output += results
+    output += "\n\n✅ You may cite PMIDs listed above. Do NOT cite any other PMIDs."
+    return output
 
 
 @tool
 def get_database_stats_tool() -> str:
-    """Get database and KG statistics."""
+    """Show vector DB and knowledge graph statistics."""
     output = f"Vector DB: {vectorstore._collection.count()} chunks\n"
     if kg_manager:
         stats = kg_manager.get_stats()
@@ -581,7 +601,7 @@ def get_database_stats_tool() -> str:
 
 @tool
 def verify_facts_tool(text: str) -> str:
-    """Verify claims in text against the knowledge graph."""
+    """Check claims in text against the knowledge graph."""
     if not kg_manager:
         return "KG not enabled"
     result = kg_manager.verify_response(text)
@@ -591,7 +611,7 @@ def verify_facts_tool(text: str) -> str:
 
 @tool
 def explore_kg_entity_tool(entity_name: str) -> str:
-    """Explore an entity in the knowledge graph."""
+    """Look up an entity and its neighbors in the knowledge graph."""
     if not kg_manager:
         return "KG not enabled"
     
@@ -607,34 +627,21 @@ def explore_kg_entity_tool(entity_name: str) -> str:
             output += f"  → {n.get('relation', 'related')} → {n['name']}\n"
     return output
 
+
 # =========================================
 # GENE INFO TOOL
 # =========================================
 
 @tool
 def gene_info_tool(gene_symbol: str) -> str:
-    """
-    Get authoritative information about a gene from NCBI and UniProt.
-    
-    ALWAYS use this tool FIRST before answering questions about a gene's
-    function, expression, or role in disease. This prevents hallucination.
-    
-    Args:
-        gene_symbol: Gene symbol (e.g., "EGFR", "TP53", "EGFLAM")
-    
-    Returns:
-        Official gene name, aliases, function summary, and associated diseases
-    """
-    # Normalize gene symbol
+    """Get gene function, aliases, diseases from NCBI+UniProt. Use FIRST for any gene question."""
     gene_symbol = gene_symbol.strip().upper()
     
     output = [f"**Gene Information: {gene_symbol}**\n"]
     sources_status = {"NCBI Gene": "❌ NOT QUERIED", "UniProt": "❌ NOT QUERIED"}
     found_info = False
     
-    # =========================================
     # 1. NCBI Gene Database
-    # =========================================
     try:
         search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
         search_params = {
@@ -698,9 +705,7 @@ def gene_info_tool(gene_symbol: str) -> str:
     except Exception as e:
         sources_status["NCBI Gene"] = f"❌ ERROR: {str(e)[:50]}"
     
-    # =========================================
     # 2. UniProt
-    # =========================================
     try:
         uniprot_url = "https://rest.uniprot.org/uniprotkb/search"
         params = {
@@ -757,9 +762,7 @@ def gene_info_tool(gene_symbol: str) -> str:
     except Exception as e:
         sources_status["UniProt"] = f"❌ ERROR: {str(e)[:50]}"
     
-    # =========================================
     # DATA SOURCE STATUS SUMMARY
-    # =========================================
     output.append("\n" + "="*50)
     output.append("**DATA SOURCE STATUS:**")
     for source, status in sources_status.items():
@@ -772,22 +775,14 @@ def gene_info_tool(gene_symbol: str) -> str:
     
     return "\n".join(output)
 
+
 # =========================================
 # GENE COORDINATES TOOL
 # =========================================
 
 @tool
 def get_gene_coordinates_tool(gene_symbol: str) -> str:
-    """
-    Get genomic coordinates for a gene (useful for regulatory/TE queries).
-    
-    Args:
-        gene_symbol: Gene name (e.g., "TP53", "EGFR")
-    
-    Returns:
-        Chromosome, start, end coordinates (GRCh38) with DATA SOURCE STATUS
-    """
-    # Normalize gene symbol
+    """Get genomic coordinates (GRCh38) for a gene from Ensembl."""
     gene_symbol = gene_symbol.strip().upper()
     
     output = []
@@ -831,7 +826,6 @@ def get_gene_coordinates_tool(gene_symbol: str) -> str:
         sources_status["Ensembl REST API"] = f"❌ ERROR"
         output.append(f"Error: {str(e)}")
     
-    # DATA SOURCE STATUS
     output.append("\n" + "="*50)
     output.append("**DATA SOURCE STATUS:**")
     for source, status in sources_status.items():
@@ -839,18 +833,9 @@ def get_gene_coordinates_tool(gene_symbol: str) -> str:
     
     return "\n".join(output)
 
+
 def get_promoter_region(gene_symbol: str, upstream: int = 1500, downstream: int = 500) -> str:
-    """
-    Get promoter coordinates for a gene.
-    
-    Args:
-        gene_symbol: Gene name (e.g., "TP53")
-        upstream: Base pairs upstream of TSS (default 1500)
-        downstream: Base pairs downstream of TSS (default 500)
-    
-    Returns:
-        Location string like "chr17:7687050-7689050"
-    """
+    """Get promoter coordinates for a gene."""
     gene_symbol = gene_symbol.strip().upper()
     
     try:
@@ -865,12 +850,11 @@ def get_promoter_region(gene_symbol: str, upstream: int = 1500, downstream: int 
             end = data.get("end")
             strand = data.get("strand", 1)
             
-            # Calculate promoter based on strand
-            if strand == 1:  # + strand, TSS is at start
+            if strand == 1:
                 tss = start
                 promoter_start = tss - upstream
                 promoter_end = tss + downstream
-            else:  # - strand, TSS is at end
+            else:
                 tss = end
                 promoter_start = tss - downstream
                 promoter_end = tss + upstream
@@ -888,17 +872,10 @@ def get_promoter_region(gene_symbol: str, upstream: int = 1500, downstream: int 
     except Exception as e:
         return {"error": str(e)}
 
+
 @tool
 def get_promoter_coordinates_tool(gene_symbol: str, upstream: int = 1500, downstream: int = 500) -> str:
-    """
-    Args:
-        gene_symbol: Gene name (e.g., "TP53", "EGFR")
-        upstream: Base pairs upstream of TSS (default 1500)
-        downstream: Base pairs downstream of TSS (default 500)
-    
-    Returns:
-        Promoter coordinates for use with AlphaGenome
-    """
+    """Get promoter region coordinates for AlphaGenome predictions."""
     result = get_promoter_region(gene_symbol, upstream, downstream)
     
     if "error" in result:
@@ -913,6 +890,7 @@ def get_promoter_coordinates_tool(gene_symbol: str, upstream: int = 1500, downst
         f"Use this location for AlphaGenome: {result['promoter_location']}"
     )
 
+
 class GenomicPredictionInput(BaseModel):
     coordinates: str = Field(
         description="Genomic coordinates in 'chr:start-end' format (e.g., 'chr17:7676000-7677000')."
@@ -925,18 +903,12 @@ class GenomicPredictionInput(BaseModel):
         description="List of assays to predict. Valid options: ['atac', 'dnase', 'rna', 'cage', 'chip_histone', 'chip_tf']."
     )
 
-# 2. Define the Tool
-# We use a global instance to avoid re-initializing the heavyweight client on every call
 PREDICTOR = AlphaGenomePredictor(skip_validation=False)
 
 @tool(args_schema=GenomicPredictionInput)
 def predict_genomics(coordinates: str, tissue: str, assays: List[str] = ["atac"]) -> str:
-    """
-    Predicts functional genomic signals (ATAC-seq, RNA-seq, etc.) for a specific 
-    coordinate range and tissue type using AlphaGenome.
-    """
+    """Predict genomic signals (ATAC/RNA/ChIP) for coordinates+tissue via AlphaGenome."""
     try:
-        # Call the existing logic from your script
         result = PREDICTOR.predict_coordinates(
             coordinates=coordinates,
             tissue=tissue,
@@ -944,13 +916,12 @@ def predict_genomics(coordinates: str, tissue: str, assays: List[str] = ["atac"]
             sequence_length="auto"
         )
         
-        # Format the output into a string the LLM can read
-        # (Using the format_results helper from your script)
         from alphagenome_tool import format_results
         return format_results(result)
         
     except Exception as e:
         return f"Error running AlphaGenome prediction: {str(e)}"
+
 
 # ============================================
 # AGENT SETUP
@@ -958,79 +929,59 @@ def predict_genomics(coordinates: str, tissue: str, assays: List[str] = ["atac"]
 
 memory = MemorySaver()
 
-system_prompt = """You are an advanced Biomedical Research Agent. Your goal is to provide fact-based, scientifically accurate answers using a specific set of computational tools.
+# ===========================================================================
+# SYSTEM PROMPT — Optimized for 8B models
+# ===========================================================================
+# Design principles:
+#   1. Keyword routing table instead of prose (fewer tokens, less ambiguity)
+#   2. Explicit "DO NOT" rules at the top (8B models respect negatives better
+#      when they come first)
+#   3. No nested markdown structure (confuses small models)
+#   4. Tool names are exact strings the model must emit
+# ===========================================================================
 
-# CRITICAL OPERATING RULES
-1. **NO HALLUCINATION:** Never guess gene functions, expression levels, or paper citations/links. If a tool returns no data, state "No data found."
-2. **VERIFY FIRST:** You must verify a gene's identity (using `gene_info_tool`) before discussing its function or expression.
-3. **CITE SOURCES:** Only cite PMIDs or data sources (e.g. "AlphaGenome") that explicitly appear in tool outputs.
+system_prompt = """You are a biomedical research assistant. Use tools to answer. Never guess.
 
-# TOOL ROUTING GUIDE (How to choose the right tool)
+STRICT RULES:
+- Never invent PMIDs. Only cite PMIDs that appear in tool output.
+- If search_literature_tool says "NO RELEVANT PAPERS", tell the user and suggest fetching papers with pubmed_search_and_store_tool. Do NOT make up citations.
+- Always use gene_info_tool FIRST before discussing any gene.
+- AlphaGenome results are AI predictions, not experiments. Say so.
 
-## CATEGORY 1: GENE QUESTIONS ("What is GENE?", "Where is GENE expressed?")
-* **Step 1: Identity (MANDATORY)**
-    * Use `gene_info_tool(gene_symbol)`
-    * *Goal:* Get the official symbol, summary, and aliases.
-* **Step 3: Coordinates (If asked about location)**
-    * Use `get_gene_coordinates_tool(gene_symbol)`
+TOOL ROUTING (pick by keyword):
+  "What is [GENE]?" / gene function / aliases → gene_info_tool
+  "Where is [GENE]?" / coordinates / location → get_gene_coordinates_tool
+  promoter / TSS / regulatory region → get_promoter_coordinates_tool
+  ATAC / ChIP / accessibility / chromatin / predict signal → predict_genomics
+  "Find papers" / fetch / download / PubMed search → pubmed_search_and_store_tool
+  "What do papers say?" / summarize / literature → search_literature_tool
+  verify / fact-check → verify_facts_tool
+  explore entity / KG / knowledge graph → explore_kg_entity_tool
+  stats / database size → get_database_stats_tool
+  general knowledge / "what do you know" / "tell me about" → search_literature_tool
 
-## CATEGORY 2: PREDICTIONS & NON-CODING ("Analyze the promoter...", "Check accessibility...")
-* **Step 1: Formulate the Tool Call**
-    * **Tool:** Use `predict_genomics` for all coordinate-based queries.
-    * **Coordinates:** strict `chr:start-end` format (e.g., "chr17:7676000-7677000").
-    * **Tissue:** Use the **common biological name** (e.g., "Lung", "HepG2", "T-cell").
-        * *Do NOT* guess ontology IDs (like UBERON:0002048). The tool will resolve names automatically.
-        * *If the tool returns an "Ambiguous Tissue" error:* It will provide a list of valid options. Retry the call using one of the exact suggested names.
+WORKFLOW FOR LITERATURE QUESTIONS:
+1. Call search_literature_tool first (checks stored papers + KG).
+2. If it says NO RELEVANT PAPERS → tell user, suggest pubmed_search_and_store_tool.
+3. After user fetches papers → call search_literature_tool again to answer.
 
-* **Step 2: Select Assays**
-    * Map the user's request to these supported assay IDs:
-        * **Accessibility:** `["atac", "dnase"]`
-        * **Expression:** `["rna", "cage", "procap"]`
-        * **Regulation:** `["chip_tf", "chip_histone"]` (includes CTCF, H3K27ac, etc.)
-        * **Structure:** `["contacts", "splice"]` (Hi-C, splicing)
-    * *Default:* If unspecified, use `["atac", "rna"]`.
+WORKFLOW FOR GENOMIC PREDICTIONS:
+1. Get coordinates: use get_gene_coordinates_tool or get_promoter_coordinates_tool.
+2. Call predict_genomics with chr:start-end, tissue name, and assay list.
+3. For tissue comparisons: make TWO separate predict_genomics calls.
 
-* **Step 3: Handling Complex Queries**
-    * **Comparisons:** ("Compare liver and brain...")
-        * The tool only accepts *one* tissue per call.
-        * You must generate **two separate tool calls** (one for "liver", one for "brain") and compare the numerical outputs in your final answer.
-    * **Specific Factors:** ("Does CTCF bind here?")
-        * Request `assays=["chip_tf"]`. The tool will return the aggregate TF signal.
-        * *Note:* You cannot filter for specific TFs (like CTCF) in the input. Request the broad assay and interpret the signal intensity as general binding potential.
-
-## CATEGORY 3: LITERATURE REVIEW ("Find papers on...", "Summarize studies...")
-* **Step 1: Check Existing Knowledge**
-    * Use `check_rag_for_topic_tool(keywords)` to see if we already have papers.
-* **Step 2: Search External (If needed)**
-    * Use `pubmed_search_and_store_tool(keywords, years, pnum)` to fetch new papers.
-* **Step 3: Synthesize**
-    * Use `search_rag_database_tool(query)` to answer using the stored papers and Knowledge Graph.
-
-# RESPONSE FORMATTING
-* **Gene Function:** Start with the official summary from `gene_info_tool`.
-* **Predictions:**
-    * **Region:** Report signal values based on the tool output and interpret them (e.g., "High ATAC signal indicates open chromatin").
-    * **Disclaimer:** Clearly state that AlphaGenome results are *AI predictions*, not experimental results.
-* **Citations:** Use standard format `[PMID: 12345678]`.
-
-# EXECUTION LOOP
-1. **Analyze Request:** Identify biological entities (Genes, Tissues, Variants).
-2. **Select Tool:** Pick the tool from the Routing Guide above.
-3. **Observe Output:** Read the tool's raw output.
-4. **Refine/Answer:** If tool fails (e.g., "Gene not found"), try an alias. If successful, synthesize the answer.
-"""
+CITATION FORMAT: [PMID: 12345678] — only from tool output."""
 
 tools = [
     pubmed_search_and_store_tool,
-    search_rag_database_tool,
-    check_rag_for_topic_tool,
+    search_literature_tool,           # ← merged check_rag + search_rag
     get_database_stats_tool,
     verify_facts_tool,
     explore_kg_entity_tool,
     get_gene_coordinates_tool,
     get_promoter_coordinates_tool,
     gene_info_tool,
-    predict_genomics
+    predict_genomics,
 ]
 
 pubmed_agent = create_agent(
@@ -1046,7 +997,7 @@ pubmed_agent = create_agent(
 
 def main():
     print("\n" + "="*60)
-    print("PubMed Research Agent v3.2 - Knowledge Graph Edition")
+    print("PubMed Research Agent v3.3 - Optimized for 8B")
     print("="*60)
     print("Commands: exit, stats, kg, vram, gc, verify <text>, entity <n>")
     print()

@@ -1,3 +1,15 @@
+"""
+BioDB Agent v2.0
+================
+Optimized for 8B parameter models (Ministral 3 8B).
+
+Changes from v1:
+- All tool docstrings compressed to 1 line
+- System prompt restructured as keyword-routing table
+- Removed verbose examples from prompt (saves ~200 tokens)
+- Tool descriptions no longer repeat argument types in prose
+"""
+
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["ATLASAPPROX_HIDECREDITS"] = "yes"
@@ -66,23 +78,14 @@ pi_llm = ChatOllama(model="ministral-3:8b")
 
 @tool
 def gene_info_tool(gene_symbol: str) -> str:
-    """
-    Args:
-        gene_symbol: Gene symbol (e.g., "EGFR", "TP53", "EGFLAM")
-    
-    Returns:
-        Official gene name, aliases, function summary, and associated diseases
-    """
-    # Normalize gene symbol
+    """Get gene function, aliases, diseases from NCBI+UniProt. Use FIRST for any gene question."""
     gene_symbol = gene_symbol.strip().upper()
     
     output = [f"**Gene Information: {gene_symbol}**\n"]
     sources_status = {"NCBI Gene": "❌ NOT QUERIED", "UniProt": "❌ NOT QUERIED"}
     found_info = False
     
-    # =========================================
     # 1. NCBI Gene Database
-    # =========================================
     try:
         search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
         search_params = {
@@ -146,9 +149,7 @@ def gene_info_tool(gene_symbol: str) -> str:
     except Exception as e:
         sources_status["NCBI Gene"] = f"❌ ERROR: {str(e)[:50]}"
     
-    # =========================================
     # 2. UniProt
-    # =========================================
     try:
         uniprot_url = "https://rest.uniprot.org/uniprotkb/search"
         params = {
@@ -205,9 +206,7 @@ def gene_info_tool(gene_symbol: str) -> str:
     except Exception as e:
         sources_status["UniProt"] = f"❌ ERROR: {str(e)[:50]}"
     
-    # =========================================
     # DATA SOURCE STATUS SUMMARY
-    # =========================================
     output.append("\n" + "="*50)
     output.append("**DATA SOURCE STATUS:**")
     for source, status in sources_status.items():
@@ -227,21 +226,7 @@ def gene_info_tool(gene_symbol: str) -> str:
 
 @tool
 def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
-    """
-    Query gene expression from GTEx (bulk RNA-seq across human tissues).
-    
-    Args:
-        gene_symbol: Gene name (e.g., "TERT", "EGFR", "TP53") or Ensembl ID
-        tissue: Optional tissue filter (e.g., "Lung", "Brain", "Liver", "Heart")
-    
-    Returns:
-        Tissue expression levels in TPM (Transcripts Per Million):
-        - Median expression across tissue samples
-        - Rank of tissues by expression level
-        - Sample size (number of donors)
-    
-    Note: GTEx measures bulk tissue averages. 
-    """
+    """Query bulk tissue expression (TPM) from GTEx v10. Returns median TPM across tissues."""
     input_symbol = gene_symbol.strip()
     output = [f"**GTEx Tissue Expression Analysis (Bulk RNA-seq)**"]
     output.append(f"Gene: {input_symbol}")
@@ -249,9 +234,7 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
         output.append(f"Tissue focus: {tissue}")
     output.append("")
     
-    # =========================================
     # STEP 1: Resolve gene symbol to GTEx Gencode ID
-    # =========================================
     gtex_id = None
     official_symbol = input_symbol.upper()
     
@@ -259,10 +242,10 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
         gtex_gene_url = "https://gtexportal.org/api/v2/reference/gene"
         params = {
             "geneId": input_symbol.upper(),
-            "gencodeVersion": "v39",  # GTEx v10 uses Gencode v39
+            "gencodeVersion": "v39",
             "genomeBuild": "GRCh38/hg38",
             "page": 0,
-            "itemsPerPage": 10  # Allow multiple matches for ambiguous symbols
+            "itemsPerPage": 10
         }
         headers = {"Accept": "application/json"}
         
@@ -273,12 +256,10 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
             gene_data = data.get("data", [])
             
             if gene_data:
-                # Take the first (best) match
                 best_match = gene_data[0]
-                gtex_id = best_match.get("gencodeId")  # Versioned ID: ENSG...XX.X
+                gtex_id = best_match.get("gencodeId")
                 official_symbol = best_match.get("geneSymbol", input_symbol.upper())
                 
-                # Get additional info if available
                 description = best_match.get("description", "")
                 
                 output.append(f"✅ Resolved: {official_symbol}")
@@ -303,9 +284,7 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
         output.append(f"❌ Error resolving gene: {str(e)[:100]}")
         return "\n".join(output)
 
-    # =========================================
     # STEP 2: Query GTEx expression data
-    # =========================================
     if not gtex_id:
         output.append("❌ Cannot query expression without valid GTEx ID.")
         output.append("\nSuggestions:")
@@ -317,7 +296,7 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
     try:
         exp_url = "https://gtexportal.org/api/v2/expression/medianGeneExpression"
         exp_params = {
-            "gencodeId": gtex_id,  # Versioned Gencode ID required
+            "gencodeId": gtex_id,
             "datasetId": "gtex_v10",
             "format": "json"
         }
@@ -342,15 +321,11 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
             output.append(f"   This gene may not be expressed or may be below detection threshold.")
             return "\n".join(output)
         
-        # =========================================
         # STEP 3: Process and display results
-        # =========================================
         output.append(f"✅ Found expression data across {len(expressions)} tissues\n")
         
-        # Sort by median expression (descending)
         sorted_exp = sorted(expressions, key=lambda x: x.get("median", 0), reverse=True)
         
-        # Filter by tissue if specified
         if tissue:
             tissue_lower = tissue.lower()
             filtered_exp = [
@@ -363,7 +338,7 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
                 output.append(f"{'Tissue':<35} {'Median TPM':>12} {'n':>5}")
                 output.append(f"{'-'*35} {'-'*12} {'-'*5}")
                 
-                for exp in filtered_exp:  # Show top 10 matches
+                for exp in filtered_exp:
                     tissue_name = exp.get("tissueSiteDetailId", "Unknown")[:34]
                     median = exp.get("median", 0)
                     n_samples = exp.get("nSamples", "N/A")
@@ -377,12 +352,10 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
             else:
                 output.append(f"⚠️  No tissues matching '{tissue}' found.")
                 output.append(f"   Available tissues include:")
-                # Show top 5 tissues as suggestions
                 for exp in sorted_exp[:5]:
                     output.append(f"   • {exp.get('tissueSiteDetailId')}")
         
         else:
-            # Show top expressed tissues
             output.append(f"**Top 10 Tissues by Expression:**")
             output.append(f"{'Rank':<5} {'Tissue':<35} {'Median TPM':>12} {'n':>5}")
             output.append(f"{'-'*5} {'-'*35} {'-'*12} {'-'*5}")
@@ -399,19 +372,17 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
                     f"{str(n_samples):>5}"
                 )
             
-            # Summary statistics
             all_medians = [e.get("median", 0) for e in expressions]
             output.append(f"\n**Summary Statistics:**")
             output.append(f"  Tissues analyzed: {len(expressions)}")
             output.append(f"  Highest expression: {sorted_exp[0].get('tissueSiteDetailId')} ({sorted_exp[0].get('median'):.2f} TPM)")
             output.append(f"  Lowest expression: {sorted_exp[-1].get('tissueSiteDetailId')} ({sorted_exp[-1].get('median'):.2f} TPM)")
         
-        # Add interpretation
         output.append(f"\n**Interpretation:**")
         output.append(f"• TPM = Transcripts Per Million (normalized for sequencing depth)")
         output.append(f"• Bulk RNA-seq measures average across all cells in tissue")
         
-        # Highlight if expression is tissue-specific or ubiquitous
+        all_medians = [e.get("median", 0) for e in expressions]
         top_tpm = sorted_exp[0].get("median", 0)
         median_tpm = sorted(all_medians)[len(all_medians)//2] if all_medians else 0
         
@@ -431,53 +402,39 @@ def gene_tissue_expression_tool(gene_symbol: str, tissue: str = None) -> str:
         output.append(f"❌ Error querying GTEx: {str(e)[:100]}")
         return "\n".join(output)
 
+
+# =========================================
+# SINGLE-CELL EXPRESSION TOOL
+# =========================================
+
 @tool
 def get_gene_fraction_detected(gene_symbol, tissue_query, organism="h_sapiens"):
-    """
-    Args:
-        - gene_symbol: Name of the gene requested
-        - tissue_query: Name of the tissue/organ requested
-    Output:
-        Top 20 cell types in the tissue/organ the gene is expressed
-    """
+    """Query single-cell expression (fraction of cells) from AtlasApprox scRNA-seq."""
     api = atlasapprox.API()
 
-    # --- STEP 1: Smart Tissue Validation ---
     try:
-        # Fetch all valid organs for this organism
         valid_organs = api.organs(organism=organism)
         
-        # Exact case-insensitive match
         match = next((o for o in valid_organs if o.lower() == tissue_query.lower()), None)
         
-        # If no exact match, try fuzzy matching (e.g. "lungs" -> "Lung")
         if not match:
             return {f"Tissue not found. Available tissues: {valid_organs}"}
         
         actual_tissue = match
 
-        # --- STEP 2: Query Fraction Detected ---
-        # "fraction_detected" returns how many cells have non-zero expression (0.0 to 1.0)
         response = api.fraction_detected(organism=organism, organ=actual_tissue, features=[gene_symbol])
 
         df = pd.DataFrame(response)
-
-        # Extract the row for our gene as a Series
         gene_series = df.loc[gene_symbol]
-        
-        # Sort descending by fraction detected
         gene_series = gene_series.sort_values(ascending=False)
-        
-        # Take Top 20
         top_20 = gene_series.head(20)
 
-        # Format for the Agent
         results = []
         for cell_type, fraction in top_20.items():
             results.append({
                 "cell_type": cell_type,
-                "fraction_detected": float(fraction),        # e.g. 0.85
-                "percent_detected": f"{fraction * 100:.1f}%" # e.g. "85.0%"
+                "fraction_detected": float(fraction),
+                "percent_detected": f"{fraction * 100:.1f}%"
             })
 
         return {
@@ -489,85 +446,54 @@ def get_gene_fraction_detected(gene_symbol, tissue_query, organism="h_sapiens"):
     except Exception as e:
         return {"error": f"An error occurred: {str(e)}"}
 
+
+# ============================================
 # AGENT SETUP
 # ============================================
 
 memory = MemorySaver()
 
-system_prompt = """You are an advanced Biomedical Research Agent. Your goal is to provide fact-based, scientifically accurate answers using a specific set of computational tools.
+# ===========================================================================
+# SYSTEM PROMPT — Optimized for 8B models
+# ===========================================================================
+# Design principles:
+#   1. Keyword routing table instead of prose
+#   2. Explicit tool names as exact strings
+#   3. No nested markdown (confuses small models)
+#   4. Minimal token count while preserving routing accuracy
+# ===========================================================================
 
-# CRITICAL OPERATING RULES
-1. **NO HALLUCINATION:** Never guess gene functions, expression levels, or paper citations/links. If a tool returns no data, state "No data found."
-2. **VERIFY FIRST:** You must verify a gene's identity (using `gene_info_tool`) before discussing its function or expression.
-3. **CITE SOURCES:** Only cite PMIDs or data sources (e.g., "GTEx v10", "CELLxGENE Census") that explicitly appear in tool outputs.
+system_prompt = """You are a biomedical database assistant. Use tools to answer. Never guess.
 
-# TOOL ROUTING GUIDE (How to choose the right tool)
+STRICT RULES:
+- Never invent data. If a tool returns no data, say "No data found."
+- Always use gene_info_tool FIRST before discussing any gene.
+- Report units: GTEx=TPM, AtlasApprox=fraction of cells, STRING=score 0-1000.
 
-## CATEGORY 1: GENE & CELL QUESTIONS ("What is GENE?", "Expression in T-cells?")
-* **Step 1: Identity (MANDATORY for Gene questions)**
-    * Use `gene_info_tool(gene_symbol)`
-    * *Goal:* Get the official symbol, summary, and aliases.
+TOOL ROUTING (pick by keyword):
+  "What is [GENE]?" / gene function / aliases → gene_info_tool
+  "Is [GENE] expressed in [TISSUE]?" / bulk / TPM / GTEx → gene_tissue_expression_tool
+  "Which cell types?" / single-cell / scRNA / fraction → get_gene_fraction_detected
+  "What interacts with?" / PPI / protein interaction → string_get_interactions
+  "What functions?" / enrichment / GO terms → string_functional_enrichment
+  network image / visualization → string_network_image
+  "What pathways?" / pathway search / keyword → kegg_search_pathways
+  "[GENE] pathways" / single gene pathway → kegg_find_pathways_for_gene
+  gene list + pathways / overlap → kegg_find_pathways_for_genes
+  pathway details / pathway ID → kegg_get_pathway
+  disease pathways / disease name → kegg_disease_pathways
 
-* **Step 2: Expression & Cell Type Analysis (Choose Context)**
-    * **Context A: "Overall / Bulk Tissue"** (e.g., "Is EGFR expressed in the lung?")
-        * Use `gene_tissue_expression_tool(gene_symbol, tissue)`
-        * *Source:* GTEx (Bulk RNA-seq). Measures average expression in whole tissue samples.
-    
-    * **Context B: "Single Cell / Specific Cell Types"** (e.g., "Is ACE2 expressed in Alveolar Macrophages?", "Compare T-cells vs B-cells")
-        * Use `get_gene_fraction_detected(gene_symbol, tissue)`
-        * *Source:* AtlasApprox (scRNA-seq). Measures expression in individual cells.
+CHOOSING EXPRESSION TOOL:
+- "expressed in lung/brain/liver" (whole tissue) → gene_tissue_expression_tool (GTEx bulk)
+- "expressed in T-cells/macrophages" (cell type) → get_gene_fraction_detected (single-cell)
+- If unsure, use gene_tissue_expression_tool first.
 
-## CATEGORY 2: PROTEIN INTERACTIONS ("What interacts with GENE?")
-* **Protein-Protein Interactions (STRING)**
-    * **Single protein:** "What interacts with TP53?"
-        * Use `string_get_interactions(proteins="TP53", min_score=700)`
-        * *Returns:* Interaction partners with confidence scores (0-1000)
-        * *Score interpretation:* ≥900 highest, ≥700 high, ≥400 medium confidence
-    * **Multiple proteins:** "Do BRCA1 and BRCA2 interact?"
-        * Use `string_get_interactions(proteins="BRCA1,BRCA2,ATM", min_score=400)`
-    * **Functional enrichment:** "What functions are enriched in this gene list?"
-        * Use `string_functional_enrichment(proteins="TP53,MDM2,CDKN1A,BAX")`
-        * *Returns:* Enriched GO terms, KEGG pathways, Pfam domains with p-values
-    * **Network visualization:**
-        * Use `string_network_image(proteins="TP53,MDM2,CDKN1A")` to get image URL
-
-## CATEGORY 3: PATHWAYS ("What pathways...", "Tell me about the X pathway")
-* **Pathway Analysis (KEGG)**
-    * **Search by keyword:** "Find pathways related to apoptosis"
-        * Use `kegg_search_pathways(query="apoptosis")`
-    * **Gene → Pathways:** "What pathways is TP53 involved in?"
-        * Use `kegg_find_pathways_for_gene(gene="TP53")`
-    * **Gene list → Pathways:** "What pathways are these genes in: BRCA1, ATM, CHEK2?"
-        * Use `kegg_find_pathways_for_genes(genes="BRCA1,ATM,CHEK2")`
-        * *Returns:* Pathways ranked by number of input genes they contain
-    * **Pathway details:** "Tell me about the cell cycle pathway"
-        * Use `kegg_get_pathway(pathway_id="hsa04110")`
-        * *Returns:* Description, gene list, and link to KEGG map
-    * **Disease pathways:** "Find pathways related to breast cancer"
-        * Use `kegg_disease_pathways(disease="breast cancer")`
-
-# RESPONSE FORMATTING
-* **Gene Function:** Start with the official summary from `gene_info_tool`.
-* **Expression Data:**
-    * **Bulk (GTEx):** Report the units (TPM).
-    * **Single Cell:** Report the **% of cells expressing** the gene.
-* **Interactions (STRING):**
-    * Report confidence level (high/medium/low based on score).
-    * Mention evidence types if relevant (experimental, database, text-mining).
-* **Pathways (KEGG):**
-    * List pathway names with IDs (e.g., "Cell cycle [hsa04110]").
-    * Include KEGG URLs when helpful for the user.
-
-# EXECUTION LOOP
-1. **Analyze Request:** Identify biological entities (Genes, Tissues, Cell Types).
-2. **Select Tool:** Pick the tool from the Routing Guide above.
-3. **Observe Output:** Read the tool's raw output.
-4. **Refine/Answer:** If tool fails (e.g., "Gene not found"), try an alias. If successful, synthesize the answer.
-"""
+STRING SCORES: ≥900=highest, ≥700=high, ≥400=medium confidence.
+KEGG IDs look like: hsa04110 (cell cycle), hsa04210 (apoptosis)."""
 
 tools = [
-    gene_tissue_expression_tool,
     gene_info_tool,
+    gene_tissue_expression_tool,
     get_gene_fraction_detected,
     # STRING
     string_get_interactions,
@@ -594,7 +520,7 @@ pubmed_agent = create_agent(
 
 def main():
     print("\n" + "="*60)
-    print("BioDB Agent")
+    print("BioDB Agent v2.0 - Optimized for 8B")
     print("="*60)
     print("Commands: exit, vram, gc")
     print()
