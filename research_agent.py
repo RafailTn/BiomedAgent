@@ -557,7 +557,7 @@ def kg_enhanced_search(query, num_results=10):
     
     output = [f"Found {len(papers)} paper(s)\n"]
     for idx, (pmid, info) in enumerate(papers.items(), 1):
-        content = "\n\n".join(info['chunks'])[:500]
+        content = "\n\n".join(info['chunks'])[:1500]
         output.append(f"\n[{idx}] PMID: {pmid}\nTitle: {info['title']}\n"
                      f"Authors: {info['authors']}\nYear: {info['year']}\n"
                      f"{content}...\n{'='*40}")
@@ -683,7 +683,7 @@ def pubmed_search_and_store_tool(keywords: str, years: str = None, pnum: int = 1
 
 
 @tool
-def search_literature_tool(query: str, num_results: int = 10) -> str:
+def search_literature_tool(query: str, num_results: int = 20) -> str:
     """Search stored papers with KG context. Only cite PMIDs from this output."""
     results, kg_context, has_relevant = kg_enhanced_search(query, num_results)
     
