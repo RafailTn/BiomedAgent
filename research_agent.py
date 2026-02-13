@@ -215,13 +215,13 @@ class HybridRetriever:
     def search(self, query, k=10):
         results = []
         try:
-            dense = self.vectorstore.similarity_search(query, k=20)
+            dense = self.vectorstore.similarity_search(query, k=k*2)
             if dense:
                 results.append(dense)
         except:
             pass
         try:
-            sparse = self.bm25_retriever.search(query, k=20)
+            sparse = self.bm25_retriever.search(query, k=k*2)
             if sparse:
                 results.append(sparse)
         except:
@@ -429,10 +429,37 @@ class AsyncPubMedFetcher:
     # [IMPROVEMENT 3] EUROPE PMC FULL-TEXT FETCHING
     # =============================================
     
-    async def fetch_full_text_europmc(self, session, pmid: str) -> Optional[str]:
-        """Try to get full text from Europe PMC (free, no key, open-access papers)."""
-        url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/{pmid}/fullTextXML"
+    async def _pmid_to_pmcid(self, session, pmid: str) -> Optional[str]:
+        """Convert PMID to PMCID via NCBI ID Converter (free, no key)."""
+        url = "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/"
+        params = {"ids": pmid, "format": "json"}
         try:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    data = await r.json(content_type=None)
+                    records = data.get("records", [])
+                    if records and records[0].get("pmcid"):
+                        return records[0]["pmcid"]
+        except Exception:
+            pass
+        return None
+    
+    async def fetch_full_text_europmc(self, session, pmid: str) -> Optional[str]:
+        """Try to get full text from Europe PMC (free, no key, open-access papers).
+        
+        Two-step: PMID → PMCID conversion, then fetch full-text XML via PMCID.
+        """
+        try:
+            # Step 1: Convert PMID to PMCID
+            async with self.semaphore:
+                pmcid = await self._pmid_to_pmcid(session, pmid)
+                await asyncio.sleep(0.2)
+            
+            if not pmcid:
+                return None  # Paper not in PMC (not open-access)
+            
+            # Step 2: Fetch full-text XML using PMCID
+            url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
             async with self.semaphore:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
                     if r.status == 200:
@@ -524,7 +551,7 @@ enc_model = HuggingFaceCrossEncoder(
     model_name='ncbi/MedCPT-Cross-Encoder',
     model_kwargs={'device': 'cuda'}
 )
-compressor = CrossEncoderReranker(model=enc_model, top_n=10)
+compressor = CrossEncoderReranker(model=enc_model, top_n=20)
 
 # BM25 and Hybrid retriever
 bm25_retriever = BM25SparseRetriever(vectorstore)
@@ -647,7 +674,7 @@ def extract_key_sentences(chunk_text: str, query: str, top_k: int = 3) -> str:
 # SEARCH FUNCTIONS
 # ============================================
 
-def kg_enhanced_search(query, num_results=10):
+def kg_enhanced_search(query, num_results=20):
     """Search with KG enhancement + extractive sentence selection.
     
     Returns (results_text, kg_context, has_relevant_papers).
@@ -663,7 +690,7 @@ def kg_enhanced_search(query, num_results=10):
         except Exception as e:
             logger.warning(f"KG expansion failed: {e}")
     
-    results = hybrid_retriever.search(query, k=num_results * 2)
+    results = hybrid_retriever.search(query, k=num_results * 3)
     if not results:
         return "NO_PAPERS_FOUND", kg_context, False
     
@@ -673,7 +700,36 @@ def kg_enhanced_search(query, num_results=10):
               and not seen.add(hash(d.page_content[:100]))]
     
     # Rerank
-    results = compressor.compress_documents(unique, query)[:num_results] if len(unique) > 1 else unique[:num_results]
+    reranked = compressor.compress_documents(unique, query) if len(unique) > 1 else unique
+    
+    # ====================================================
+    # PAPER DIVERSITY: max 2 chunks per paper, then fill
+    # ====================================================
+    # Without this, 10 chunks often come from just ~5 papers.
+    # Cap at 2 chunks per PMID so more unique papers appear.
+    MAX_CHUNKS_PER_PAPER = 2
+    seen_pmids = defaultdict(int)
+    diverse_results = []
+    overflow = []
+    
+    for doc in reranked:
+        pmid = doc.metadata.get("pmid", "unknown")
+        if seen_pmids[pmid] < MAX_CHUNKS_PER_PAPER:
+            diverse_results.append(doc)
+            seen_pmids[pmid] += 1
+        else:
+            overflow.append(doc)
+        if len(diverse_results) >= num_results:
+            break
+    
+    # If we still have room, fill with overflow (3rd+ chunks from same papers)
+    if len(diverse_results) < num_results:
+        for doc in overflow:
+            diverse_results.append(doc)
+            if len(diverse_results) >= num_results:
+                break
+    
+    results = diverse_results
     
     # ====================================================
     # RELEVANCE CHECK: Determine if results actually match
@@ -995,7 +1051,7 @@ def pubmed_search_and_store_tool(keywords: str, years: str = None, pnum: int = 1
 
 
 @tool
-def search_literature_tool(query: str, num_results: int = 10) -> str:
+def search_literature_tool(query: str, num_results: int = 20) -> str:
     """Search stored papers with KG context. Only cite PMIDs from this output."""
     results, kg_context, has_relevant = kg_enhanced_search(query, num_results)
     
