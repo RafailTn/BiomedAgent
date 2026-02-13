@@ -1,6 +1,6 @@
 """
-PubMed Research Agent v3.3
-==========================
+PubMed Research Agent v3.3 (with Dedup & Full-Text Integration)
+===============================================================
 Optimized for 8B parameter models (Ministral 3 8B).
 
 Changes from v3.2:
@@ -9,6 +9,10 @@ Changes from v3.2:
 - System prompt restructured as keyword-routing table
 - PMID hallucination guard: RAG tool explicitly flags when no papers match
 - Tool count reduced from 10 to 9
+
+Integrated from v4.0-lite:
+- [IMPROVEMENT 1] PMID dedup at ingest — prevents duplicate chunks in vectorstore
+- [IMPROVEMENT 2] Europe PMC full-text fetching (PMID→PMCID conversion)
 """
 
 import os
@@ -283,8 +287,70 @@ class AsyncPubMedFetcher:
                     results.update(self._parse_xml(r))
         return results
     
-    async def fetch_full_texts(self, pmids):
-        return {p: None for p in pmids}
+    # =============================================
+    # [IMPROVEMENT 2] EUROPE PMC FULL-TEXT FETCHING
+    # =============================================
+    
+    async def _pmid_to_pmcid(self, session, pmid: str) -> Optional[str]:
+        """Convert PMID to PMCID via NCBI ID Converter (free, no key)."""
+        url = "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/"
+        params = {"ids": pmid, "format": "json"}
+        try:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    data = await r.json(content_type=None)
+                    records = data.get("records", [])
+                    if records and records[0].get("pmcid"):
+                        return records[0]["pmcid"]
+        except Exception:
+            pass
+        return None
+    
+    async def fetch_full_text_europmc(self, session, pmid: str) -> Optional[str]:
+        """Try to get full text from Europe PMC (free, no key, open-access papers)."""
+        try:
+            # Step 1: Convert PMID to PMCID
+            async with self.semaphore:
+                pmcid = await self._pmid_to_pmcid(session, pmid)
+                await asyncio.sleep(0.2)
+            
+            if not pmcid:
+                return None  # Paper not in PMC (not open-access)
+            
+            # Step 2: Fetch full-text XML using PMCID
+            url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
+            async with self.semaphore:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    if r.status == 200:
+                        xml_text = await r.text()
+                        root = ET.fromstring(xml_text)
+                        body = root.find('.//body')
+                        if body is not None:
+                            paragraphs = []
+                            for p in body.iter('p'):
+                                text = ''.join(p.itertext()).strip()
+                                if text and len(text) > 20:
+                                    paragraphs.append(text)
+                            if paragraphs:
+                                full_text = "\n\n".join(paragraphs)
+                                # Cap at ~8000 chars to keep chunks manageable
+                                return full_text[:8000]
+                    await asyncio.sleep(0.2)
+        except Exception as e:
+            logger.debug(f"Europe PMC full-text not available for PMID:{pmid}: {e}")
+        return None
+    
+    async def fetch_full_texts(self, pmids: List[str]) -> Dict[str, Optional[str]]:
+        """Try to fetch full texts for a list of PMIDs from Europe PMC."""
+        self.semaphore = asyncio.Semaphore(self.max_concurrent)
+        results = {}
+        async with aiohttp.ClientSession() as session:
+            for pmid in pmids:
+                full_text = await self.fetch_full_text_europmc(session, pmid)
+                results[pmid] = full_text
+                if full_text:
+                    logger.info(f"  ✓ Full-text retrieved for PMID:{pmid} ({len(full_text)} chars)")
+        return results
     
     def _parse_xml(self, xml_text):
         results = {}
@@ -321,7 +387,7 @@ class AsyncPubMedFetcher:
 # ============================================
 
 logger.info("="*60)
-logger.info("PubMed Research Agent v3.3")
+logger.info("PubMed Research Agent v3.3 (with Dedup & Full-Text)")
 logger.info("="*60)
 
 # MedCPT embeddings
@@ -411,6 +477,22 @@ logger.info(f"VRAM: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
 
 # ============================================
+# [IMPROVEMENT 1] PMID DEDUP HELPER
+# ============================================
+
+def is_pmid_stored(pmid: str) -> bool:
+    """Check if a PMID is already in the vectorstore."""
+    try:
+        existing = vectorstore._collection.get(
+            where={"pmid": pmid},
+            limit=1
+        )
+        return bool(existing and existing.get('ids'))
+    except Exception:
+        return False
+
+
+# ============================================
 # SEARCH FUNCTIONS
 # ============================================
 
@@ -488,52 +570,91 @@ def kg_enhanced_search(query, num_results=10):
 # ============================================
 
 async def async_pubmed_search_and_store(keywords, years=None, pnum=5):
-    """Search PubMed and store papers."""
+    """Search PubMed, fetch full-text where available, store with dedup."""
     year_list = [str(date.today().year)] if not years else (
         [str(y) for y in range(int(years.split("-")[0]), int(years.split("-")[1])+1)] 
         if "-" in years else [years]
     )
     
     total_stored = 0
+    total_skipped = 0
+    total_fulltext = 0
     all_papers = []
     
+    # STEP 1: PubMed Search
+    pubmed_articles = {}
     for year in year_list:
         pmids = await async_fetcher.search(f"({keywords}) AND {year}[pdat]", retmax=pnum)
-        if not pmids:
+        if pmids:
+            articles = await async_fetcher.fetch_abstracts(pmids)
+            pubmed_articles.update(articles)
+    
+    logger.info(f"PubMed: found {len(pubmed_articles)} papers")
+    
+    if not pubmed_articles:
+        return "No papers found on PubMed for this query."
+    
+    # STEP 2: Fetch Full-Texts from Europe PMC
+    all_pmids = list(pubmed_articles.keys())
+    logger.info(f"Attempting full-text fetch for {len(all_pmids)} PMIDs via Europe PMC...")
+    full_texts = await async_fetcher.fetch_full_texts(all_pmids)
+    ft_count = sum(1 for v in full_texts.values() if v)
+    logger.info(f"  Full-text retrieved for {ft_count}/{len(all_pmids)} papers")
+    
+    # STEP 3: Store papers (with dedup + full-text)
+    for pmid, article in pubmed_articles.items():
+        if is_pmid_stored(pmid):
+            logger.debug(f"Skipping duplicate: {pmid}")
+            total_skipped += 1
             continue
         
-        articles = await async_fetcher.fetch_abstracts(pmids)
-        
-        for pmid, article in articles.items():
-            try:
-                content = f"PMID: {pmid}\nTitle: {article['title']}\n" \
-                         f"Authors: {article['authors']}\nYear: {year}\n\n{article['abstract']}"
-                
-                chunks = text_splitter.split_text(content)
-                docs = [Document(
-                    page_content=c,
-                    metadata={
-                        "pmid": pmid, "title": article['title'],
-                        "authors": article['authors'], "year": year,
-                        "chunk_index": i, "source": "pubmed"
-                    }
-                ) for i, c in enumerate(chunks)]
-                
-                vectorstore.add_documents(docs)
-                
-                if kg_manager:
-                    try:
-                        kg_manager.process_paper(pmid, article['title'], article['abstract'], year)
-                    except:
-                        pass
-                
-                all_papers.append(f"{article['title']} (PMID:{pmid})")
-                total_stored += 1
-            except:
-                pass
+        try:
+            # Use full-text if available, otherwise abstract
+            text_content = full_texts.get(pmid) or article['abstract']
+            has_fulltext = full_texts.get(pmid) is not None
+            if has_fulltext:
+                total_fulltext += 1
+            
+            year = article.get('year') or year_list[0]
+            source = "pubmed+fulltext" if has_fulltext else "pubmed"
+            
+            content = f"PMID: {pmid}\nTitle: {article['title']}\n" \
+                     f"Authors: {article['authors']}\nYear: {year}\n\n{text_content}"
+            
+            chunks = text_splitter.split_text(content)
+            docs = [Document(
+                page_content=c,
+                metadata={
+                    "pmid": pmid, "title": article['title'],
+                    "authors": article['authors'], "year": year,
+                    "chunk_index": i, "source": source
+                }
+            ) for i, c in enumerate(chunks)]
+            
+            vectorstore.add_documents(docs)
+            
+            if kg_manager:
+                try:
+                    kg_manager.process_paper(pmid, article['title'], article['abstract'], year)
+                except:
+                    pass
+            
+            all_papers.append(f"{article['title']} (PMID:{pmid})")
+            total_stored += 1
+        except:
+            pass
     
     bm25_retriever.refresh()
-    return f"Stored {total_stored} papers:\n" + "\n".join(f"• {p}" for p in all_papers)
+    
+    summary_parts = [f"Stored {total_stored} papers"]
+    if total_skipped > 0:
+        summary_parts.append(f"({total_skipped} duplicates skipped)")
+    if total_fulltext > 0:
+        summary_parts.append(f"({total_fulltext} with full-text)")
+    
+    summary = " ".join(summary_parts) + ":\n"
+    summary += "\n".join(f"• {p}" for p in all_papers)
+    return summary
 
 
 def pubmed_search_and_store(keywords, years=None, pnum=10):
