@@ -488,7 +488,7 @@ CHOOSING EXPRESSION TOOL:
 - "expressed in T-cells/macrophages" (cell type) → get_gene_fraction_detected (single-cell)
 - If unsure, use gene_tissue_expression_tool first.
 
-STRING SCORES: ≥900=highest, ≥700=high, ≥400=medium confidence.
+STRING SCORES: ≥0.900=highest, ≥0.700=high, ≥0.400=medium confidence.
 KEGG IDs look like: hsa04110 (cell cycle), hsa04210 (apoptosis)."""
 
 tools = [

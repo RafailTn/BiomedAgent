@@ -330,10 +330,16 @@ class KEGGClient:
     
     BASE_URL = "https://rest.kegg.jp"
     
-    # Common organism codes
+    # Common organism codes (includes aliases 8B models may generate)
     ORGANISMS = {
         "human": "hsa",
+        "homo sapiens": "hsa",
+        "homo_sapiens": "hsa",
+        "h_sapiens": "hsa",
+        "h. sapiens": "hsa",
+        "hsa": "hsa",
         "mouse": "mmu",
+        "mus musculus": "mmu",
         "rat": "rno",
         "zebrafish": "dre",
         "fly": "dme",
@@ -554,8 +560,12 @@ class KEGGClient:
         else:
             org_code = organism.lower()
         
-        # First, try to find the gene
-        gene_result = self._request("find", "genes", f"{gene}")
+        # First, try organism-specific gene search (more reliable than global)
+        gene_result = self._request("find", org_code, gene)
+        
+        if gene_result.startswith("ERROR"):
+            # Fallback: try global gene search
+            gene_result = self._request("find", "genes", f"{gene}")
         
         if gene_result.startswith("ERROR"):
             return {"error": gene_result}
@@ -566,12 +576,21 @@ class KEGGClient:
             if "\t" in line:
                 gid = line.split("\t")[0]
                 if gid.startswith(f"{org_code}:"):
-                    kegg_gene_id = gid
-                    break
+                    # Also check the description contains our gene symbol
+                    desc = line.split("\t")[1].upper() if len(line.split("\t")) > 1 else ""
+                    if gene.upper() in desc or kegg_gene_id is None:
+                        kegg_gene_id = gid
+                        if gene.upper() in desc:
+                            break  # Exact match found
         
         if not kegg_gene_id:
-            # Try direct format
-            kegg_gene_id = f"{org_code}:{gene}"
+            return {
+                "gene": gene,
+                "kegg_id": None,
+                "n_pathways": 0,
+                "pathways": [],
+                "error": f"Gene '{gene}' not found in KEGG for organism {org_code}",
+            }
         
         # Get pathways for this gene
         pathway_result = self._request("link", "pathway", kegg_gene_id)
@@ -764,11 +783,11 @@ def format_string_interactions(result: Dict[str, Any]) -> str:
         for p in result.get("partners", [])[:15]:
             score = p.get("combined_score", 0)
             # Score interpretation
-            if score >= 900:
+            if score >= 0.900:
                 confidence = "highest"
-            elif score >= 700:
+            elif score >= 0.700:
                 confidence = "high"
-            elif score >= 400:
+            elif score >= 0.400:
                 confidence = "medium"
             else:
                 confidence = "low"
@@ -798,10 +817,10 @@ def format_string_interactions(result: Dict[str, Any]) -> str:
     
     lines.append("")
     lines.append("**Score interpretation:**")
-    lines.append("• ≥900: Highest confidence")
-    lines.append("• ≥700: High confidence")
-    lines.append("• ≥400: Medium confidence")
-    lines.append("• <400: Low confidence")
+    lines.append("• ≥0.900: Highest confidence")
+    lines.append("• ≥0.700: High confidence")
+    lines.append("• ≥0.400: Medium confidence")
+    lines.append("• <0.400: Low confidence")
     
     return "\n".join(lines)
 
@@ -938,7 +957,21 @@ try:
         species: str = "human",
         min_score: int = 400,
     ) -> str:
-        """Get protein-protein interactions from STRING. proteins=comma-separated, min_score: 900=highest,700=high,400=medium."""
+        """
+        Get protein-protein interactions from STRING database.
+        
+        Args:
+            proteins: Comma-separated protein/gene names (e.g., "TP53,MDM2,CDKN1A")
+            species: Species name (human, mouse, rat, zebrafish, fly, worm, yeast)
+            min_score: Minimum confidence score (0-1000):
+                      - 0.900: highest confidence
+                      - 0.700: high confidence  
+                      - 0.400: medium confidence (default)
+                      - 0.150: low confidence
+        
+        Returns:
+            Interaction network with scores and evidence types.
+        """
         client = _get_string()
         protein_list = [p.strip() for p in proteins.split(",") if p.strip()]
         
@@ -958,7 +991,22 @@ try:
         proteins: str,
         species: str = "human",
     ) -> str:
-        """Find enriched GO terms, KEGG pathways, Pfam domains for a comma-separated protein list."""
+        """
+        Perform functional enrichment analysis on a set of proteins using STRING.
+        
+        Identifies enriched GO terms, KEGG pathways, Pfam domains, and other
+        functional categories in your protein set.
+        
+        Args:
+            proteins: Comma-separated protein/gene names (e.g., "TP53,BRCA1,ATM,CHEK2")
+            species: Species name
+            
+        Returns:
+            Enriched functional terms grouped by category with p-values.
+            
+        Example:
+            string_functional_enrichment(proteins="TP53,BRCA1,ATM,CHEK2,BRCA2")
+        """
         client = _get_string()
         protein_list = [p.strip() for p in proteins.split(",") if p.strip()]
         
@@ -969,9 +1017,19 @@ try:
     def string_network_image(
         proteins: str,
         species: str = "human",
-        min_score: int = 400,
+        min_score: float = 0.400,
     ) -> str:
-        """Get URL for STRING network visualization image. proteins=comma-separated."""
+        """
+        Get URL for STRING network visualization image.
+        
+        Args:
+            proteins: Comma-separated protein names
+            species: Species name
+            min_score: Minimum confidence score
+            
+        Returns:
+            URL to PNG image of the interaction network.
+        """
         client = _get_string()
         protein_list = [p.strip() for p in proteins.split(",") if p.strip()]
         
@@ -985,7 +1043,23 @@ try:
         query: str,
         organism: str = "human",
     ) -> str:
-        """Search KEGG pathways by keyword (e.g. "apoptosis", "cell cycle", "cancer")."""
+        """
+        Search KEGG for pathways by keyword.
+        
+        KEGG (Kyoto Encyclopedia of Genes and Genomes) contains curated pathway
+        maps for metabolism, signaling, disease, and more.
+        
+        Args:
+            query: Search term (e.g., "apoptosis", "cell cycle", "MAPK", "cancer")
+            organism: Organism (human, mouse, rat, etc.)
+            
+        Returns:
+            List of matching pathways with IDs and links.
+            
+        Example:
+            kegg_search_pathways(query="apoptosis")
+            kegg_search_pathways(query="breast cancer")
+        """
         client = _get_kegg()
         result = client.search_pathways(query, organism)
         return format_kegg_pathways(result)
@@ -994,7 +1068,16 @@ try:
     def kegg_get_pathway(
         pathway_id: str,
     ) -> str:
-        """Get detailed info (genes, description) for a KEGG pathway ID like "hsa04110"."""
+        """
+        Get detailed information about a KEGG pathway.
+        
+        Args:
+            pathway_id: KEGG pathway ID (e.g., "hsa04110" for cell cycle,
+                       "hsa04210" for apoptosis, "hsa05200" for pathways in cancer)
+                       
+        Returns:
+            Pathway details including genes and description.
+        """
         client = _get_kegg()
         result = client.get_pathway(pathway_id)
         return format_kegg_pathway_detail(result)
@@ -1004,7 +1087,19 @@ try:
         gene: str,
         organism: str = "human",
     ) -> str:
-        """Find all KEGG pathways containing a single gene (e.g. gene="TP53")."""
+        """
+        Find all KEGG pathways that contain a specific gene.
+        
+        Args:
+            gene: Gene symbol (e.g., "TP53", "BRCA1", "EGFR")
+            organism: Organism name
+            
+        Returns:
+            List of pathways containing the gene with links.
+            
+        Example:
+            kegg_find_pathways_for_gene(gene="TP53")
+        """
         client = _get_kegg()
         result = client.find_pathways_for_gene(gene, organism)
         return format_kegg_pathways(result)
@@ -1014,7 +1109,16 @@ try:
         genes: str,
         organism: str = "human",
     ) -> str:
-        """Find KEGG pathways shared by a comma-separated gene list, ranked by overlap."""
+        """
+        Find KEGG pathways enriched for a set of genes.
+        
+        Args:
+            genes: Comma-separated gene symbols (e.g., "TP53,BRCA1,ATM,CHEK2")
+            organism: Organism name
+            
+        Returns:
+            Pathways ranked by gene overlap.
+        """
         client = _get_kegg()
         gene_list = [g.strip() for g in genes.split(",") if g.strip()]
         result = client.find_pathways_for_genes(gene_list, organism)
@@ -1024,7 +1128,16 @@ try:
     def kegg_disease_pathways(
         disease: str,
     ) -> str:
-        """Search KEGG for disease-related pathways (e.g. "breast cancer", "diabetes")."""
+        """
+        Search for disease-related pathways in KEGG.
+        
+        Args:
+            disease: Disease name (e.g., "cancer", "diabetes", "alzheimer", 
+                    "parkinson", "leukemia", "breast cancer")
+                    
+        Returns:
+            Disease-related pathways.
+        """
         client = _get_kegg()
         result = client.get_disease_pathways(disease)
         return format_kegg_pathways(result)
