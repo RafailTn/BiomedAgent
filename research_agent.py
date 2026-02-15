@@ -156,7 +156,7 @@ class MedCPTEmbeddings(Embeddings):
 # HYBRID RETRIEVAL
 # ============================================
 
-def reciprocal_rank_fusion(results_lists, k=60, top_n=None):
+def reciprocal_rank_fusion(results_lists, k=40, top_n=None):
     """Fuse multiple result lists using RRF."""
     scores = defaultdict(float)
     doc_map = {}
@@ -211,16 +211,16 @@ class HybridRetriever:
         self.vectorstore = vectorstore
         self.bm25_retriever = bm25_retriever
     
-    def search(self, query, k=10):
+    def search(self, query, k=20):
         results = []
         try:
-            dense = self.vectorstore.similarity_search(query, k=20)
+            dense = self.vectorstore.similarity_search(query, k=40)
             if dense:
                 results.append(dense)
         except:
             pass
         try:
-            sparse = self.bm25_retriever.search(query, k=20)
+            sparse = self.bm25_retriever.search(query, k=40)
             if sparse:
                 results.append(sparse)
         except:
@@ -410,7 +410,7 @@ enc_model = HuggingFaceCrossEncoder(
     model_name='ncbi/MedCPT-Cross-Encoder',
     model_kwargs={'device': 'cuda'}
 )
-compressor = CrossEncoderReranker(model=enc_model, top_n=10)
+compressor = CrossEncoderReranker(model=enc_model, top_n=40)
 
 # BM25 and Hybrid retriever
 bm25_retriever = BM25SparseRetriever(vectorstore)
