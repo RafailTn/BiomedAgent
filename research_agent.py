@@ -1091,7 +1091,8 @@ WORKFLOW FOR GENOMIC PREDICTIONS:
 2. Call predict_genomics with chr:start-end, tissue name, and assay list.
 3. For tissue comparisons: make TWO separate predict_genomics calls.
 
-CITATION FORMAT: [PMID: 12345678] — only from tool output."""
+CITATION FORMAT: [PMID: 12345678] — only from tool output.
+LINK RULE: Always use https://pubmed.ncbi.nlm.nih.gov/PMID/ — NEVER construct doi.org or dx.doi.org links."""
 
 tools = [
     pubmed_search_and_store_tool,
