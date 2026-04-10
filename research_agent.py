@@ -558,7 +558,7 @@ def kg_enhanced_search(query, num_results=10):
     output = [f"Found {len(papers)} paper(s)\n"]
     for idx, (pmid, info) in enumerate(papers.items(), 1):
         content = "\n\n".join(info['chunks'])[:1500]
-        output.append(f"\n[{idx}] PMID: {pmid}\nTitle: {info['title']}\n"
+        output.append(f"\n--- PMID: {pmid}-Title: {info['title']} ---\n"
                      f"Authors: {info['authors']}\nYear: {info['year']}\n"
                      f"{content}...\n{'='*40}")
     
