@@ -6,6 +6,9 @@
 .env.production.local
 kuzu_biomedical_kg
 
+# HTTP cache (requests-cache)
+http_cache.sqlite
+
 # Python
 __pycache__/
 *.py[cod]

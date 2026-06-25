@@ -9,12 +9,21 @@ Tools for querying:
 Both use official REST APIs - no API key required.
 """
 
-import requests
+import time
+import threading
 import logging
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 
+import http_client
+
 logger = logging.getLogger(__name__)
+
+# KEGG asks for <=3 requests/sec. Serialize KEGG calls with a small floor so the
+# multi-gene enrichment loop doesn't get throttled or silently drop genes.
+_KEGG_MIN_INTERVAL = 0.34
+_kegg_lock = threading.Lock()
+_kegg_last = 0.0
 
 
 # ============================================================================
@@ -53,17 +62,17 @@ class STRINGClient:
     def _request(self, endpoint: str, params: Dict) -> Any:
         """Make API request."""
         url = f"{self.BASE_URL}/{self.format}/{endpoint}"
-        
+
         try:
-            response = requests.get(url, params=params, timeout=30)
+            response = http_client.get(url, params=params, timeout=30)
             response.raise_for_status()
-            
+
             if self.format == "json":
                 return response.json()
             else:
                 return response.text
-                
-        except requests.RequestException as e:
+
+        except Exception as e:
             logger.error(f"STRING API error: {e}")
             return {"error": str(e)}
     
@@ -182,63 +191,6 @@ class STRINGClient:
             }
         return result
     
-    def get_functional_enrichment(
-        self,
-        proteins: List[str],
-        species: str = "human",
-    ) -> Dict[str, Any]:
-        """
-        Get functional enrichment analysis for a set of proteins.
-        
-        Returns enriched GO terms, KEGG pathways, Pfam domains, etc.
-        
-        Args:
-            proteins: List of protein/gene names
-            species: Species name
-            
-        Returns:
-            Dict with enriched terms grouped by category
-        """
-        if isinstance(species, str) and species.lower() in self.SPECIES:
-            species_id = self.SPECIES[species.lower()]
-        else:
-            species_id = 9606
-        
-        params = {
-            "identifiers": "%0d".join(proteins),
-            "species": species_id,
-        }
-        
-        result = self._request("enrichment", params)
-        
-        if isinstance(result, list):
-            # Group by category
-            grouped = {}
-            for term in result:
-                category = term.get("category", "Unknown")
-                if category not in grouped:
-                    grouped[category] = []
-                grouped[category].append({
-                    "term": term.get("term", ""),
-                    "description": term.get("description", ""),
-                    "p_value": term.get("p_value", 1.0),
-                    "fdr": term.get("fdr", 1.0),
-                    "genes_in_term": term.get("number_of_genes", 0),
-                    "genes_matched": term.get("number_of_genes_in_background", 0),
-                    "input_genes": term.get("inputGenes", ""),
-                })
-            
-            # Sort each category by p-value
-            for cat in grouped:
-                grouped[cat].sort(key=lambda x: x["p_value"])
-            
-            return {
-                "query_proteins": proteins,
-                "n_proteins": len(proteins),
-                "enrichment_by_category": grouped,
-            }
-        return result
-    
     def get_protein_info(
         self,
         proteins: List[str],
@@ -352,12 +304,21 @@ class KEGGClient:
         """Make KEGG API request."""
         path = "/".join([operation] + list(args))
         url = f"{self.BASE_URL}/{path}"
-        
+
+        # Throttle KEGG to its documented rate limit (cache hits don't count, but
+        # over-throttling them is cheap).
+        global _kegg_last
+        with _kegg_lock:
+            wait = _KEGG_MIN_INTERVAL - (time.monotonic() - _kegg_last)
+            if wait > 0:
+                time.sleep(wait)
+            _kegg_last = time.monotonic()
+
         try:
-            response = requests.get(url, timeout=30)
+            response = http_client.get(url, timeout=30)
             response.raise_for_status()
             return response.text
-        except requests.RequestException as e:
+        except Exception as e:
             logger.error(f"KEGG API error: {e}")
             return f"ERROR: {e}"
     
@@ -662,67 +623,6 @@ class KEGGClient:
             "pathways": pathways,
         }
     
-    def find_pathways_for_genes(
-        self,
-        genes: List[str],
-        organism: str = "human",
-    ) -> Dict[str, Any]:
-        """
-        Find pathways containing multiple genes (pathway enrichment-like).
-        
-        Args:
-            genes: List of gene symbols
-            organism: Organism name
-            
-        Returns:
-            Dict with pathways and gene overlap counts
-        """
-        if organism.lower() in self.ORGANISMS:
-            org_code = self.ORGANISMS[organism.lower()]
-        else:
-            org_code = organism.lower()
-        
-        # Collect pathways for each gene
-        pathway_counts = {}  # pathway_id -> {name, genes}
-        
-        for gene in genes[:20]:  # Limit to avoid rate limiting
-            result = self.find_pathways_for_gene(gene, organism)
-            if "pathways" in result:
-                for p in result["pathways"]:
-                    pid = p["pathway_id"]
-                    if pid not in pathway_counts:
-                        pathway_counts[pid] = {
-                            "name": p["name"],
-                            "genes": [],
-                            "url": p["url"],
-                        }
-                    pathway_counts[pid]["genes"].append(gene)
-        
-        # Sort by number of genes
-        sorted_pathways = sorted(
-            pathway_counts.items(),
-            key=lambda x: len(x[1]["genes"]),
-            reverse=True
-        )
-        
-        pathways = [
-            {
-                "pathway_id": pid,
-                "name": data["name"],
-                "genes_in_input": data["genes"],
-                "n_genes_matched": len(data["genes"]),
-                "url": data["url"],
-            }
-            for pid, data in sorted_pathways
-        ]
-        
-        return {
-            "query_genes": genes,
-            "n_genes_queried": len(genes),
-            "n_pathways_found": len(pathways),
-            "pathways": pathways,
-        }
-    
     def get_disease_pathways(
         self,
         disease: str,
@@ -821,43 +721,6 @@ def format_string_interactions(result: Dict[str, Any]) -> str:
     lines.append("• ≥0.700: High confidence")
     lines.append("• ≥0.400: Medium confidence")
     lines.append("• <0.400: Low confidence")
-    
-    return "\n".join(lines)
-
-
-def format_string_enrichment(result: Dict[str, Any]) -> str:
-    """Format STRING enrichment results for agent."""
-    if "error" in result:
-        return f"❌ Error: {result['error']}"
-    
-    lines = []
-    lines.append("=" * 60)
-    lines.append("**STRING Functional Enrichment Analysis**")
-    lines.append("=" * 60)
-    lines.append(f"Query proteins: {', '.join(result.get('query_proteins', []))}")
-    lines.append("")
-    
-    for category, terms in result.get("enrichment_by_category", {}).items():
-        lines.append(f"**{category}:**")
-        lines.append("-" * 40)
-        
-        for term in terms[:5]:  # Top 5 per category
-            fdr = term.get("fdr", 1)
-            if fdr < 0.001:
-                sig = "***"
-            elif fdr < 0.01:
-                sig = "**"
-            elif fdr < 0.05:
-                sig = "*"
-            else:
-                sig = ""
-            
-            lines.append(f"• {term.get('description', term.get('term', '?'))}{sig}")
-            lines.append(f"    FDR: {fdr:.2e}, Genes: {term.get('input_genes', '')}")
-        
-        lines.append("")
-    
-    lines.append("Significance: *** p<0.001, ** p<0.01, * p<0.05")
     
     return "\n".join(lines)
 
@@ -987,33 +850,6 @@ try:
         return format_string_interactions(result)
     
     @tool
-    def string_functional_enrichment(
-        proteins: str,
-        species: str = "human",
-    ) -> str:
-        """
-        Perform functional enrichment analysis on a set of proteins using STRING.
-        
-        Identifies enriched GO terms, KEGG pathways, Pfam domains, and other
-        functional categories in your protein set.
-        
-        Args:
-            proteins: Comma-separated protein/gene names (e.g., "TP53,BRCA1,ATM,CHEK2")
-            species: Species name
-            
-        Returns:
-            Enriched functional terms grouped by category with p-values.
-            
-        Example:
-            string_functional_enrichment(proteins="TP53,BRCA1,ATM,CHEK2,BRCA2")
-        """
-        client = _get_string()
-        protein_list = [p.strip() for p in proteins.split(",") if p.strip()]
-        
-        result = client.get_functional_enrichment(protein_list, species)
-        return format_string_enrichment(result)
-    
-    @tool
     def string_network_image(
         proteins: str,
         species: str = "human",
@@ -1102,26 +938,6 @@ try:
         """
         client = _get_kegg()
         result = client.find_pathways_for_gene(gene, organism)
-        return format_kegg_pathways(result)
-    
-    @tool
-    def kegg_find_pathways_for_genes(
-        genes: str,
-        organism: str = "human",
-    ) -> str:
-        """
-        Find KEGG pathways enriched for a set of genes.
-        
-        Args:
-            genes: Comma-separated gene symbols (e.g., "TP53,BRCA1,ATM,CHEK2")
-            organism: Organism name
-            
-        Returns:
-            Pathways ranked by gene overlap.
-        """
-        client = _get_kegg()
-        gene_list = [g.strip() for g in genes.split(",") if g.strip()]
-        result = client.find_pathways_for_genes(gene_list, organism)
         return format_kegg_pathways(result)
     
     @tool
