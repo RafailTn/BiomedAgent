@@ -84,6 +84,7 @@ ROUTING:
   pathway search by keyword / details by ID    → kegg_search_pathways / kegg_get_pathway
   pathways for a DISEASE                       → kegg_disease_pathways
   network image                                → string_network_image
+  availability of public datasets / "is there a GEO study/dataset on X" / "find RNA-seq data for X" → geo_search_tool  (finds studies only — NOT expression values; for expression use GTEx/HPA/AtlasApprox)
 
 Cell-type tools: plain "which cell types express X" → hpa_protein_atlas_tool (human) or get_gene_fraction_detected (non-human); only superlative "most/highest/top" → gene_highest_expression_celltype; "markers of cell type Y" → get_cell_type_markers.
 

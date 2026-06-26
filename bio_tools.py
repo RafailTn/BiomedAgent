@@ -541,6 +541,103 @@ def get_gene_fraction_detected(gene_symbol: str, organ: str, organism: str = "h_
         return f"❌ Error querying AtlasApprox: {str(e)[:150]}"
 
 
+# =========================================
+# GEO DATASET AVAILABILITY  (NCBI E-utilities, db=gds)
+# =========================================
+
+# Common DataSet-type filters, mapped from loose user phrasing to GEO's exact
+# "DataSet Type" vocabulary so the [DataSet Type] field tag actually matches.
+_GEO_TYPE_ALIASES = {
+    "rna-seq": "Expression profiling by high throughput sequencing",
+    "rnaseq": "Expression profiling by high throughput sequencing",
+    "scrna-seq": "Expression profiling by high throughput sequencing",
+    "single-cell": "Expression profiling by high throughput sequencing",
+    "microarray": "Expression profiling by array",
+    "array": "Expression profiling by array",
+    "atac-seq": "Genome binding/occupancy profiling by high throughput sequencing",
+    "chip-seq": "Genome binding/occupancy profiling by high throughput sequencing",
+    "methylation": "Methylation profiling by high throughput sequencing",
+}
+
+
+@tool
+def geo_search_tool(query: str, organism: str = "", study_type: str = "",
+                    max_results: int = 10) -> str:
+    """Check NCBI GEO (Gene Expression Omnibus) for the AVAILABILITY of public studies/datasets
+    matching a topic, disease, gene, or tissue. Returns GSE accessions, titles, organism,
+    sample counts, dates, and links — NOT expression values. Use for "is there a dataset/study
+    on X", "find GEO data for X", "are there RNA-seq studies of disease Y". For actual expression
+    levels use the GTEx / HPA / AtlasApprox tools instead.
+
+    organism: optional, e.g. "Homo sapiens" or "Mus musculus" (restricts to that species).
+    study_type: optional, e.g. "rna-seq", "microarray", "atac-seq", "chip-seq", "methylation".
+    """
+    term = query.strip()
+    if not term:
+        return "Provide a search topic (disease, gene, tissue, or keywords)."
+    if organism:
+        term += f' AND "{organism.strip()}"[Organism]'
+    if study_type:
+        gds_type = _GEO_TYPE_ALIASES.get(study_type.lower().strip(), study_type.strip())
+        term += f' AND "{gds_type}"[DataSet Type]'
+
+    base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+    try:
+        es = http_client.get_ncbi(
+            base + "esearch.fcgi",
+            params={"db": "gds", "term": term, "retmax": max(1, min(max_results, 50)),
+                    "retmode": "json"},
+        ).json()
+        ids = es.get("esearchresult", {}).get("idlist", [])
+        total = es.get("esearchresult", {}).get("count", "0")
+        if not ids:
+            return (f"No GEO studies found for: {query}"
+                    + (f" (organism={organism})" if organism else "")
+                    + (f" (type={study_type})" if study_type else "")
+                    + ".")
+
+        summ = http_client.get_ncbi(
+            base + "esummary.fcgi",
+            params={"db": "gds", "id": ",".join(ids), "retmode": "json"},
+        ).json().get("result", {})
+
+        lines = [f"**GEO study availability for: {query}** "
+                 f"(showing {len(ids)} of {total} matches)\n"]
+        for uid in ids:
+            rec = summ.get(uid)
+            if not isinstance(rec, dict):
+                continue
+            acc = rec.get("accession", "").strip()
+            title = rec.get("title", "(no title)").strip()
+            taxon = rec.get("taxon", "").strip()
+            n = rec.get("n_samples", "")
+            gtype = rec.get("gdstype", "").strip()
+            date = rec.get("pdat", "").strip()
+            link = (f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={acc}"
+                    if acc.startswith("GSE") else "")
+            lines.append(f"- **{acc or uid}** — {title}")
+            meta = []
+            if taxon:
+                meta.append(taxon)
+            if n:
+                meta.append(f"{n} samples")
+            if gtype:
+                meta.append(gtype)
+            if date:
+                meta.append(date)
+            if meta:
+                lines.append(f"  {' | '.join(meta)}")
+            if link:
+                lines.append(f"  {link}")
+        lines.append("\nNote: lists study availability/metadata only — not expression values.")
+        lines.append("If a link returns a 500/502 error, retry — these are transient NCBI "
+                     "server errors; the accession can also be pasted into "
+                     "https://www.ncbi.nlm.nih.gov/geo/ to find the study manually.")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ Error querying GEO: {str(e)[:150]}"
+
+
 # All non-pathway tools, for convenient import.
 BIO_TOOLS = [
     gene_info_tool,
@@ -552,4 +649,5 @@ BIO_TOOLS = [
     get_gene_fraction_detected,
     get_cell_type_markers,
     gene_highest_expression_celltype,
+    geo_search_tool,
 ]
