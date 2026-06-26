@@ -41,7 +41,13 @@ load_dotenv()
 Entrez.email = "rafailadam46@gmail.com"
 
 LLM_MODEL = "qwen3.5:9b"
-pi_llm = ChatOllama(model=LLM_MODEL)
+# num_ctx caps prompt + generated tokens combined. Ollama's 4096 default is too
+# small here: tool outputs are large Markdown blocks that accumulate in the
+# MemorySaver history, so the prompt alone can reach ~4000 tokens after a couple
+# of turns — leaving no room for the answer (done_reason="length") or, one turn
+# later, nothing at all. 8192 doubles the room and fits entirely in VRAM on an
+# 8 GB card (16384 spilled ~1.2 GB to CPU and slowed generation).
+pi_llm = ChatOllama(model=LLM_MODEL, num_ctx=8192)
 
 
 def unload_llm():

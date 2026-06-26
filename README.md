@@ -41,7 +41,17 @@ no cloud inference.
 
 ## Usage
 
-Run the interactive REPL:
+### Web GUI (Chainlit)
+
+```bash
+pixi run --manifest-path dependencies/pixi.toml chainlit run app.py -w
+```
+
+Opens a chat UI at http://localhost:8000. Tool calls are shown as collapsible
+steps, so you can see which tool the agent routed each question to. Each browser
+session gets its own conversation memory.
+
+### Command-line REPL
 
 ```bash
 pixi run --manifest-path dependencies/pixi.toml python unified_agent.py
@@ -54,7 +64,7 @@ Then type a question, e.g.:
 >>> Which cell types express CD8A in humans?
 ```
 
-Commands:
+REPL commands:
 
 - `exit` / `quit` — stop the model in Ollama and quit
 - `unload` — drop the model from VRAM without quitting

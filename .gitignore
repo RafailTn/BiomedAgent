@@ -48,3 +48,4 @@ medcpt_pubmed_rag_db/
 primekg_data/
 geo_rag_db/
 test/
+.chainlit/
