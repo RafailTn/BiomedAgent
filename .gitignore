@@ -5,6 +5,7 @@
 .env.test.local
 .env.production.local
 kuzu_biomedical_kg
+CLAUDE.md
 
 # HTTP cache (requests-cache)
 http_cache.sqlite
