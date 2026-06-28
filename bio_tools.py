@@ -11,15 +11,21 @@ Imported by unified_agent.py (and usable standalone).
 import os
 os.environ.setdefault("ATLASAPPROX_HIDECREDITS", "yes")
 
+import io
 import logging
 from functools import lru_cache
 from typing import List, Optional
 
 import requests
+import urllib3
 import pandas as pd
 from dotenv import load_dotenv
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
+
+# m6A-Atlas (rnamd.org) serves over HTTPS with an invalid certificate, so its
+# tool must call with verify=False; silence the resulting per-request warning.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 import http_client
 from opentargets_tool import query_gene_diseases
@@ -638,6 +644,105 @@ def geo_search_tool(query: str, organism: str = "", study_type: str = "",
         return f"❌ Error querying GEO: {str(e)[:150]}"
 
 
+# =========================================
+# m6A RNA METHYLATION  (m6A-Atlas v2.0, rnamd.org)
+# =========================================
+
+# Map common organism names to m6A-Atlas's CamelCase scientific-name vocabulary.
+_M6A_SPECIES = {
+    "human": "HomoSapiens", "homo sapiens": "HomoSapiens", "h_sapiens": "HomoSapiens",
+    "mouse": "MusMusculus", "mus musculus": "MusMusculus", "m_musculus": "MusMusculus",
+    "rat": "RattusNorvegicus", "rattus norvegicus": "RattusNorvegicus",
+    "zebrafish": "DanioRerio", "danio rerio": "DanioRerio",
+    "yeast": "SaccharomycesCerevisiae", "saccharomyces cerevisiae": "SaccharomycesCerevisiae",
+    "arabidopsis": "ArabidopsisThaliana", "arabidopsis thaliana": "ArabidopsisThaliana",
+}
+
+
+@tool
+def m6a_modification_tool(gene_symbol: str, organism: str = "human", resolution: str = "high") -> str:
+    """Check the m6A-Atlas for N6-methyladenosine (m6A) RNA methylation on a GENE: whether the
+    gene's transcript carries m6A modifications and WHERE (transcript region + genomic
+    coordinates), with supporting evidence. Use for "does GENE have m6A / is GENE m6A-methylated /
+    where is GENE methylated / m6A sites on GENE". This is RNA methylation (epitranscriptomics),
+    not DNA methylation. resolution='high' returns single-base sites (default); 'low' returns
+    MeRIP-seq peak regions with differential signal (Log2FC). Human by default.
+    """
+    species = _M6A_SPECIES.get(organism.lower().strip())
+    if not species:
+        return (f"❌ '{organism}' is not a supported m6A-Atlas species. "
+                f"Supported: {', '.join(sorted(set(_M6A_SPECIES.values())))}.")
+    symbol = (resolve_symbol(gene_symbol) or gene_symbol.strip()).upper()
+    high = resolution.lower().strip() != "low"
+    endpoint = "apiHighResolution.php" if high else "apiLowResolution.php"
+    res_label = "single-base resolution" if high else "MeRIP-seq peak resolution"
+
+    try:
+        resp = http_client.get(
+            f"https://www.rnamd.org/m6a/{endpoint}",
+            params={"species": species, "gene": symbol},
+            verify=False, timeout=30,  # invalid TLS cert; data is public read-only
+        )
+        text = resp.text or ""
+        if not text.strip():
+            return f"No response from m6A-Atlas for {symbol} ({species})."
+        df = pd.read_csv(io.StringIO(text), sep="\t")
+    except Exception as e:
+        return f"❌ Error querying m6A-Atlas: {str(e)[:150]}"
+
+    # The 'gene' filter is server-side, but keep only exact GeneName matches as a
+    # safety net against any loose/partial matching.
+    if "GeneName" in df.columns:
+        df = df[df["GeneName"].astype(str).str.upper() == symbol]
+    if df.empty:
+        return (f"No m6A sites reported for {symbol} in {species} "
+                f"(m6A-Atlas v2.0, {res_label}).")
+
+    n = len(df)
+    title = "m6A sites" if high else "m6A MeRIP-seq peaks"
+    lines = [f"**{title} for {symbol} ({species}) — m6A-Atlas v2.0, {res_label}**",
+             f"Total: {n}\n"]
+
+    # Transcript-region breakdown (the 'where', categorically).
+    if "Region" in df.columns:
+        lines.append("By transcript region:")
+        for region, count in df["Region"].value_counts().items():
+            lines.append(f"  {region}: {count}")
+        lines.append("")
+
+    if high:
+        # Rank single-base sites by how many conditions/datasets support them.
+        support_col = "ConditionNum" if "ConditionNum" in df.columns else None
+        view = df.sort_values(support_col, ascending=False) if support_col else df
+        lines.append(f"Top sites (by supporting conditions):")
+        lines.append(f"{'Position':<24} {'Strand':<6} {'Region':<14} {'#cond':>6}")
+        lines.append(f"{'-'*24} {'-'*6} {'-'*14} {'-'*6}")
+        for _, r in view.head(10).iterrows():
+            pos = f"{r.get('Seqname', '?')}:{r.get('Position', '?')}"
+            support = r.get(support_col, "") if support_col else ""
+            lines.append(f"{pos[:24]:<24} {str(r.get('Strand', '')):<6} "
+                         f"{str(r.get('Region', ''))[:14]:<14} {str(support):>6}")
+    else:
+        # Rank MeRIP peaks by enrichment (Log2FC) when available.
+        if "Log2FC" in df.columns:
+            df["Log2FC"] = pd.to_numeric(df["Log2FC"], errors="coerce")
+            view = df.sort_values("Log2FC", ascending=False)
+        else:
+            view = df
+        lines.append("Top peaks (by Log2FC enrichment):")
+        lines.append(f"{'Region (chr:start-end)':<30} {'Region':<14} {'Log2FC':>8} {'CellLine':<14}")
+        lines.append(f"{'-'*30} {'-'*14} {'-'*8} {'-'*14}")
+        for _, r in view.head(10).iterrows():
+            loc = f"{r.get('Seqname', '?')}:{r.get('Start', '?')}-{r.get('End', '?')}"
+            fc = r.get("Log2FC", "")
+            fc = f"{fc:.2f}" if isinstance(fc, float) and pd.notna(fc) else str(fc)
+            lines.append(f"{loc[:30]:<30} {str(r.get('Region', ''))[:14]:<14} "
+                         f"{fc:>8} {str(r.get('CellLine', ''))[:14]:<14}")
+
+    lines.append("\nSource: m6A-Atlas v2.0 (rnamd.org). m6A is RNA (not DNA) methylation.")
+    return "\n".join(lines)
+
+
 # All non-pathway tools, for convenient import.
 BIO_TOOLS = [
     gene_info_tool,
@@ -650,4 +755,5 @@ BIO_TOOLS = [
     get_cell_type_markers,
     gene_highest_expression_celltype,
     geo_search_tool,
+    m6a_modification_tool,
 ]
