@@ -660,13 +660,19 @@ _M6A_SPECIES = {
 
 
 @tool
-def m6a_modification_tool(gene_symbol: str, organism: str = "human", resolution: str = "high") -> str:
+def m6a_modification_tool(gene_symbol: str, organism: str = "human", resolution: str = "high",
+                          tissue: str = "") -> str:
     """Check the m6A-Atlas for N6-methyladenosine (m6A) RNA methylation on a GENE: whether the
     gene's transcript carries m6A modifications and WHERE (transcript region + genomic
     coordinates), with supporting evidence. Use for "does GENE have m6A / is GENE m6A-methylated /
     where is GENE methylated / m6A sites on GENE". This is RNA methylation (epitranscriptomics),
     not DNA methylation. resolution='high' returns single-base sites (default); 'low' returns
     MeRIP-seq peak regions with differential signal (Log2FC). Human by default.
+
+    tissue: optional cell-line or tissue name to restrict the sites to (e.g. "HepG2", "HeLa",
+    "liver", "heart"). Matched case-insensitively against m6A-Atlas's own cell-line/tissue
+    vocabulary; if nothing matches, the reply lists which cell lines/tissues ARE available for
+    that gene. Use it for "does GENE have m6A in TISSUE / m6A sites of GENE in TISSUE".
     """
     species = _M6A_SPECIES.get(organism.lower().strip())
     if not species:
@@ -698,9 +704,24 @@ def m6a_modification_tool(gene_symbol: str, organism: str = "human", resolution:
         return (f"No m6A sites reported for {symbol} in {species} "
                 f"(m6A-Atlas v2.0, {res_label}).")
 
+    # Optional tissue/cell-line filter. Done client-side (case-insensitive substring)
+    # so it works for high-resolution too, which has no server-side cell-line param.
+    # The CellLine field can be a ';'-joined list of cell lines per site.
+    if tissue and "CellLine" in df.columns:
+        want = tissue.strip()
+        matched = df[df["CellLine"].astype(str).str.contains(want, case=False, na=False, regex=False)]
+        if matched.empty:
+            avail = sorted({c.strip() for cell in df["CellLine"].astype(str)
+                            for c in cell.split(";") if c.strip()})
+            return (f"No m6A sites for {symbol} in tissue/cell-line matching '{tissue}' "
+                    f"({species}, {res_label}). Available for this gene: "
+                    f"{', '.join(avail[:30])}{' …' if len(avail) > 30 else ''}.")
+        df = matched
+
     n = len(df)
+    scope = f" in {tissue}" if tissue else ""
     title = "m6A sites" if high else "m6A MeRIP-seq peaks"
-    lines = [f"**{title} for {symbol} ({species}) — m6A-Atlas v2.0, {res_label}**",
+    lines = [f"**{title} for {symbol} ({species}){scope} — m6A-Atlas v2.0, {res_label}**",
              f"Total: {n}\n"]
 
     # Transcript-region breakdown (the 'where', categorically).
